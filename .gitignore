@@ -1,0 +1,7 @@
+.pio/
+.vscode/
+.clang_complete
+.gcc-flags.json
+*.o
+*.elf
+*.hex
