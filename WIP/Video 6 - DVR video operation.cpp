@@ -10,8 +10,6 @@
     DVR shutter held down to Switch on
     DVR power goes off with +BAT
 
-    Designed for easy observation with a multimeter or oscilloscope.
-
 */
 
 #include <Arduino.h>

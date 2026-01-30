@@ -1,50 +1,56 @@
+/*
+  INT1 sanity test
+
+  - D3 (INT1) rising edge triggers a visible flash on D6
+  - Nothing else
+*/
+
 #include <Arduino.h>
+#include <avr/interrupt.h>
 
-static constexpr uint8_t PIN_INTN = 2;   // D2 / INT0
-static constexpr uint8_t PIN_LED  = 13;  // onboard LED
+static constexpr uint8_t PIN_STATUS = 3;  // D3 / INT1
+static constexpr uint8_t PIN_LED    = 6;  // D6 test LED
 
-volatile uint32_t g_intCount = 0;
+// Flag set by ISR
+volatile bool g_flashRequest = false;
 
-void onIntFalling() {
-  g_intCount++;
+// INT1 ISR
+ISR(INT1_vect)
+{
+  g_flashRequest = true;   // keep ISR minimal
 }
 
-void setup() {
+void setup()
+{
   pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_STATUS, INPUT);   // change to INPUT_PULLUP if required
+
   digitalWrite(PIN_LED, LOW);
 
-  pinMode(PIN_INTN, INPUT_PULLUP);
   Serial.begin(115200);
+  delay(200);
+  Serial.println(F("INT1 rising-edge LED flash test"));
 
-  attachInterrupt(digitalPinToInterrupt(PIN_INTN), onIntFalling, FALLING);
-
-  Serial.println(F("\n--- INT# test ---"));
-  Serial.println(F("Expect D2 HIGH normally; pulses LOW increments counter."));
+  // Configure INT1 for RISING edge
+  cli();
+  EICRA &= ~(_BV(ISC11) | _BV(ISC10));
+  EICRA |=  (_BV(ISC11) | _BV(ISC10));   // 11 = rising edge
+  EIFR  |=  _BV(INTF1);                  // clear pending
+  EIMSK |=  _BV(INT1);                   // enable INT1
+  sei();
 }
 
-void loop() {
-  static uint32_t last = 0;
-  static uint32_t lastPrint = 0;
+void loop()
+{
+  if (g_flashRequest)
+  {
+    g_flashRequest = false;
 
-  noInterrupts();
-  uint32_t c = g_intCount;
-  interrupts();
-
-  if (c != last) {
-    last = c;
+    // Visible LED pulse
     digitalWrite(PIN_LED, HIGH);
-    delay(20);
+    delay(50);            // 50 ms = very obvious flash
     digitalWrite(PIN_LED, LOW);
 
-    Serial.print(F("INT fired. Count="));
-    Serial.println(c);
-  }
-
-  if (millis() - lastPrint > 2000) {
-    lastPrint = millis();
-    Serial.print(F("Heartbeat. D2="));
-    Serial.print(digitalRead(PIN_INTN) ? "HIGH" : "LOW");
-    Serial.print(F(" Count="));
-    Serial.println(c);
+    Serial.println(F("INT1 rising edge detected"));
   }
 }
