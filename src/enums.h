@@ -10,7 +10,9 @@
 // - FSM consumes events and updates controller state (pure decision).
 // - FSM emits actions (commands) into an action queue.
 // - Action executor performs commands non-blocking using timestamps.
-
+//
+// updated to use 8 bits bytes to save SRAM
+//
 #pragma once
 
 #include <stdint.h>
