@@ -35,10 +35,12 @@
 // Adjust later if you want “feel” changes without touching state logic.
 // -----------------------------------------------------------------------------
 
-// Button press classification
-#define T_BTN_DEBOUNCE_MS           35
-#define T_BTN_SHORT_MIN_MS          50
-#define T_BTN_LONG_MS             1200
+// Button press classification (LTC2954)
+#define T_BTN_DEBOUNCE_MS            35   // Ignore noise / bounce
+#define T_BTN_SHORT_MIN_MS           50   // Minimum valid press (UI tap)
+#define T_BTN_WAKE_MIN_MS           350   // Minimum press required to wake / re-enable power path (ONT ≈300 ms)
+#define T_BTN_GRACE_MS              500   // Graceful shutdown request.  Stop recording and switch off.
+#define T_BTN_NUCLEAR_MS           1500   // Just power off now - hardware will kick in and shutdown by force
 
 // Buzzer patterns (example placeholders)
 #define T_BEEP_MS                  80
