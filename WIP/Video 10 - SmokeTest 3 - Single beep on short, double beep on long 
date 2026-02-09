@@ -1,0 +1,153 @@
+#include "config.h"
+#include "event_queue.h"
+#include "action_queue.h"
+#include "executor.h"
+
+// Pull in the canonical timing constants (updated)
+#include "timings.h"
+
+static volatile uint8_t s_last_int_level = 1; // 1=deasserted (pull-up)
+
+// Timing capture (main-context reads; ISR writes only level + event)
+static uint32_t g_last_assert_ms = 0;   // for dt between asserts
+static uint32_t g_last_down_ms   = 0;   // for press length
+
+// Button interpretation state
+static bool     g_btn_down = false;
+static bool     g_grace_fired = false;
+
+// Helper: enqueue a beep action
+static inline void enqueue_beep(uint32_t now, beep_pattern_t pat)
+{
+    action_t a;
+    a.t_enq_ms = now;
+    a.id       = ACT_BEEP;
+    a.arg0     = (uint16_t)pat;
+    a.arg1     = 0;
+    actionq_push(&a);
+}
+
+static void isr_ltc_int_change()
+{
+    const uint8_t level = (uint8_t)digitalRead(PIN_LTC_INT_N); // HIGH or LOW
+
+    // Only enqueue when the level actually changes (belt + braces)
+    if (level == s_last_int_level)
+        return;
+
+    s_last_int_level = level;
+
+    event_t e;
+    e.t_ms   = millis(); // OK for smoke test; replace with tick counter later
+    e.src    = SRC_LTC;
+    e.reason = (level == LTC_INT_ASSERT_LEVEL) ? EVR_EDGE_FALL : EVR_EDGE_RISE;
+    e.arg0   = (uint16_t)level;
+    e.arg1   = 0;
+
+    e.id = (level == LTC_INT_ASSERT_LEVEL) ? EV_LTC_INT_ASSERTED : EV_LTC_INT_DEASSERTED;
+
+    eventq_push_isr(&e);
+}
+
+void setup()
+{
+#if CFG_DEBUG_SERIAL
+    Serial.begin(115200);
+#endif
+
+    pins_init();
+
+    eventq_init();
+    actionq_init();
+    executor_init();
+
+    // Prime last level + dt baseline
+    s_last_int_level = (uint8_t)digitalRead(PIN_LTC_INT_N);
+    g_last_assert_ms = millis();
+    g_last_down_ms   = 0;
+    g_btn_down       = false;
+    g_grace_fired    = false;
+
+    // Attach INT0 (D2) change interrupt
+    attachInterrupt(digitalPinToInterrupt(PIN_LTC_INT_N), isr_ltc_int_change, CHANGE);
+
+#if CFG_DEBUG_SERIAL
+    Serial.print("SMOKE: short press -> BEEP_SINGLE (");
+    Serial.print(T_BTN_SHORT_MIN_MS); Serial.print(".."); Serial.print(T_BTN_GRACE_MS);
+    Serial.println("ms), hold>=GRACE -> BEEP_DOUBLE");
+#endif
+}
+
+void loop()
+{
+    const uint32_t now = millis();
+
+    // 1) If button is held, fire graceful shutdown beep ONCE at threshold (T_BTN_GRACE_MS)
+    if (g_btn_down && !g_grace_fired)
+    {
+        const uint32_t held_ms = now - g_last_down_ms; // wrap-safe
+        if (held_ms >= T_BTN_GRACE_MS)
+        {
+            g_grace_fired = true;
+            enqueue_beep(now, BEEP_DOUBLE);
+
+#if CFG_DEBUG_SERIAL
+            Serial.print("GRACE HOLD fired at ms="); Serial.println((uint32_t)held_ms);
+#endif
+        }
+    }
+
+    // 2) Drain edge events
+    event_t ev;
+    while (eventq_pop(&ev))
+    {
+#if CFG_DEBUG_SERIAL
+        Serial.print("EV id="); Serial.print((uint8_t)ev.id);
+        Serial.print(" level="); Serial.print(ev.arg0);
+        Serial.print(" t="); Serial.println(ev.t_ms);
+#endif
+
+        if (ev.id == EV_LTC_INT_ASSERTED)
+        {
+#if CFG_DEBUG_SERIAL
+            uint32_t dt = ev.t_ms - g_last_assert_ms;   // wrap-safe
+            g_last_assert_ms = ev.t_ms;
+            Serial.print("ASSERT dt_ms="); Serial.println(dt);
+#endif
+            g_last_down_ms = ev.t_ms;
+            g_btn_down     = true;
+            g_grace_fired  = false;
+        }
+        else if (ev.id == EV_LTC_INT_DEASSERTED)
+        {
+            if (g_btn_down && (g_last_down_ms != 0))
+            {
+                const uint32_t press_ms = ev.t_ms - g_last_down_ms; // wrap-safe
+
+#if CFG_DEBUG_SERIAL
+                Serial.print("PRESS ms="); Serial.println(press_ms);
+#endif
+
+                // If graceful already fired, do NOT also treat as short press.
+                if (!g_grace_fired)
+                {
+                    // Short press: valid release between SHORT_MIN and GRACE threshold
+                    if (press_ms >= T_BTN_SHORT_MIN_MS && press_ms < T_BTN_GRACE_MS)
+                    {
+                        enqueue_beep(now, BEEP_SINGLE);
+                    }
+                    // <SHORT_MIN ignored
+                    // >=GRACE: user held long enough; we either fired grace while held,
+                    //          or they released right around the boundary (no short press).
+                }
+            }
+
+            g_btn_down     = false;
+            g_last_down_ms = 0;
+            // keep g_grace_fired as-is; it will be reset on next ASSERT
+        }
+    }
+
+    // 3) Always advance executor (runs beep + led engines)
+    executor_poll(now);
+}
