@@ -31,6 +31,14 @@
 #define T_ABN_OFF_MIN_MS          800
 
 // -----------------------------------------------------------------------------
+// DVR button press waveform timing
+// -----------------------------------------------------------------------------
+#define T_DVR_PRESS_SHORT_MS    120     // Short press emulation for DVR UI 
+#define T_DVR_PRESS_LONG_MS    1500     // Long press emulation 
+#define T_DVR_PRESS_GAP_MS      200     // Mandatory dead-time after releasing DVR button
+
+
+// -----------------------------------------------------------------------------
 // Optional UX / debounce timing knobs (start as sane defaults)
 // Adjust later if you want “feel” changes without touching state logic.
 // -----------------------------------------------------------------------------
