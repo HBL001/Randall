@@ -1,5 +1,4 @@
 // pins.h
-// Randall Sport Camera Controller (ATmega328P / Arduino Nano compatible)
 //
 // Authoritative pin mapping per:
 // - "Randall - User Story - Final - Frozen Feb,8,26"

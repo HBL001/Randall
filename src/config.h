@@ -1,10 +1,6 @@
 // config.h
 // Randall Sport Camera Controller
-//
-// Single point of truth for build configuration and global assumptions.
-// This file MUST be included before any module headers in main.cpp.
-//
-// No logic. No functions. No state.
+
 
 #pragma once
 
