@@ -27,3 +27,10 @@
 // -----------------------------------------------------------------------------
 #define T_BOOT_TIMEOUT_MS          8000    // Time allowed for DVR to reach stable LED signature
 #define T_ERROR_AUTOOFF_MS         2500    // Time we signal error before cutting power / returning OFF
+
+// -----------------------------------------------------------------------------
+// DVR shutter emulation timing (executor waveform)  [OUTPUT SIDE]
+// -----------------------------------------------------------------------------
+#define T_DVR_PRESS_SHORT_MS        500    
+#define T_DVR_PRESS_LONG_MS        3000    
+#define T_DVR_PRESS_GAP_MS          500    
