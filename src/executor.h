@@ -1,11 +1,11 @@
 // executor.h
 // Non-blocking action executor for:
-//   - ACT_BEEP (buzzer patterns)
-//   - ACT_LED_PATTERN (status LED patterns)
-//
+//   - ACT_BEEP
+//   - ACT_LED_PATTERN
+//   - ACT_DVR_PRESS_SHORT / ACT_DVR_PRESS_LONG
 // Model:
 // - Executor is a tiny state machine driven by executor_poll(now_ms).
-// - It processes one action at a time (deterministic).
+// - It processes one action at a time.
 // - No delay(). No blocking. Uses deadlines.
 
 #pragma once

@@ -33,9 +33,9 @@
 // -----------------------------------------------------------------------------
 // DVR button press waveform timing
 // -----------------------------------------------------------------------------
-#define T_DVR_PRESS_SHORT_MS    120     // Short press emulation for DVR UI 
-#define T_DVR_PRESS_LONG_MS    1500     // Long press emulation 
-#define T_DVR_PRESS_GAP_MS      200     // Mandatory dead-time after releasing DVR button
+#define T_DVR_PRESS_SHORT_MS    500     // Short press emulation for DVR UI 
+#define T_DVR_PRESS_LONG_MS    3000     // Long press emulation 
+#define T_DVR_PRESS_GAP_MS      500     // Mandatory dead-time after releasing DVR button
 
 
 // -----------------------------------------------------------------------------

@@ -1,6 +1,15 @@
-// executor.cpp (concurrent LED + BEEP engines)
+// executor.cpp 
+// concurrent 
+//      LED + BEEP engines 
+//      DVR button press engine 
+//  handle 
+//  ACT_DVR_PRESS_SHORT/LONG
+//
+// - DVR press engine is non-blocking and runs concurrently with LED + BEEP.
+// - Policy ignore new DVR press requests while one is active.
 
 #include "executor.h"
+#include "timings.h"   
 
 // ----------------------------------------------------------------------------
 // Internal state (two independent engines)
@@ -17,6 +26,14 @@ static uint8_t        s_beep_remaining = 0;
 static uint8_t        s_beep_phase = 0;      // 0=on, 1=gap, 2=done-gap
 static uint32_t       s_beep_next_ms = 0;
 
+// ----------------------------------------------------------------------------
+// NEW: DVR press engine state (one-shot waveform)
+// ----------------------------------------------------------------------------
+static bool           s_dvr_active = false;
+static bool           s_dvr_pressed = false;
+static uint32_t       s_dvr_next_ms = 0;
+static uint16_t       s_dvr_press_ms = 0;
+
 static inline void led_set(bool on)
 {
     digitalWrite(PIN_STATUS_LED, on ? STATUS_LED_ON_LEVEL : STATUS_LED_OFF_LEVEL);
@@ -25,6 +42,13 @@ static inline void led_set(bool on)
 static inline void buzz_set(bool on)
 {
     digitalWrite(PIN_BUZZER_OUT, on ? BUZZER_ON_LEVEL : BUZZER_OFF_LEVEL);
+}
+
+
+// DVR button emulation helper 
+static inline void dvr_btn_set(bool pressed)
+{
+    digitalWrite(PIN_DVR_BTN_CMD, pressed ? DVR_BTN_PRESS_LEVEL : DVR_BTN_RELEASE_LEVEL);
 }
 
 void executor_abort_feedback(void)
@@ -41,18 +65,30 @@ void executor_abort_feedback(void)
     s_beep_phase = 0;
     s_beep_next_ms = 0;
     buzz_set(false);
+
+    
+    //  abort any in-flight DVR press
+    s_dvr_active = false;
+    s_dvr_pressed = false;
+    s_dvr_next_ms = 0;
+    s_dvr_press_ms = 0;
+    dvr_btn_set(false);
 }
 
 bool executor_busy(void)
 {
-    // LED can be "busy" forever; treat only beep as busy for now
-    return s_beep_active;
+    // treat beep OR DVR press as "busy"
+    return s_beep_active || s_dvr_active;
 }
 
 void executor_init(void)
 {
     led_set(false);
     buzz_set(false);
+
+    // NEW: ensure DVR line starts released
+    dvr_btn_set(false);
+
     executor_abort_feedback();
 }
 
@@ -182,13 +218,49 @@ static void beep_step(uint32_t now_ms)
 }
 
 // ----------------------------------------------------------------------------
-// Executor poll: apply queued actions, then step both engines
+// NEW: DVR press engine (one-shot press + optional gap)
+// ----------------------------------------------------------------------------
+
+static void start_dvr_press(uint32_t now_ms, uint16_t press_ms)
+{
+    // Safe deterministic policy: ignore if already pressing
+    if (s_dvr_active) return;
+
+    s_dvr_active   = true;
+    s_dvr_pressed  = true;
+    s_dvr_press_ms = press_ms;
+
+    dvr_btn_set(true);                    // press now
+    s_dvr_next_ms = now_ms + press_ms;    // schedule release
+}
+
+static void dvr_step(uint32_t now_ms)
+{
+    if (!s_dvr_active) return;
+    if (now_ms < s_dvr_next_ms) return;
+
+    if (s_dvr_pressed)
+    {
+        // Release
+        s_dvr_pressed = false;
+        dvr_btn_set(false);
+        s_dvr_next_ms = now_ms + T_DVR_PRESS_GAP_MS;  // gap before next allowed press
+        return;
+    }
+
+    // Finished (post-gap)
+    s_dvr_active = false;
+}
+
+// ----------------------------------------------------------------------------
+// Executor poll: apply queued actions, then step all engines
 // ----------------------------------------------------------------------------
 
 void executor_poll(uint32_t now_ms)
 {
     // Drain queued actions quickly (deterministic order)
-    // LED_PATTERN overwrites, BEEP starts a one-shot (can interrupt prior beep).
+    // LED_PATTERN overwrites, BEEP starts a one-shot.
+    // NEW: DVR press actions run via their own engine.
     action_t a;
     while (actionq_pop(&a))
     {
@@ -204,13 +276,25 @@ void executor_poll(uint32_t now_ms)
                 start_beep(now_ms, (beep_pattern_t)(a.arg0 & 0xFF));
                 break;
 
+            // ----------------------------------------------------------------
+            // NEW: DVR button press actions
+            // ----------------------------------------------------------------
+            case ACT_DVR_PRESS_SHORT:
+                start_dvr_press(now_ms, T_DVR_PRESS_SHORT_MS);
+                break;
+
+            case ACT_DVR_PRESS_LONG:
+                start_dvr_press(now_ms, T_DVR_PRESS_LONG_MS);
+                break;
+
             default:
                 // ignore unsupported actions deterministically
                 break;
         }
     }
 
-    // Always advance both engines
+    // Always advance all engines
     led_step(now_ms);
     beep_step(now_ms);
+    dvr_step(now_ms);
 }
