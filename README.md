@@ -11,7 +11,7 @@ The firmware:
 
 The purpose is to transform a **state-opaque, unreliable consumer camera** into a **predictable embedded subsystem** suitable for battery-powered and fault-sensitive applications.
 
-No delays. No RTOS. No guessing what state the camera is in.
+Simple bare-metal approach ~1K of SRAM
 
 ---
 
