@@ -8,8 +8,10 @@
 // - DVR press engine is non-blocking and runs concurrently with LED + BEEP.
 // - Policy: ignore new DVR press requests while one is active.
 
-#include "executor.h"
-#include "timings.h"
+#include <executor.h>
+#include <timings.h>
+#include <power_mgr.h>
+
 
 // ----------------------------------------------------------------------------
 // Internal state (independent engines)
@@ -264,9 +266,17 @@ void executor_poll(uint32_t now_ms)
             case ACT_DVR_PRESS_LONG:
                 start_dvr_press(now_ms, T_DVR_PRESS_LONG_MS);
                 break;
+				
+			case ACT_LTC_KILL_ASSERT:
+				power_mgr_kill_assert();
+				break;
+
+			case ACT_LTC_KILL_DEASSERT:
+				power_mgr_kill_deassert();
+				break;
 
             default:
-                break; // ignore deterministically
+                break; 
         }
     }
 
