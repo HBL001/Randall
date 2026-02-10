@@ -41,9 +41,6 @@ typedef enum
 static seq_state_t s_seq = SEQ_IDLE;
 static uint32_t    s_deadline_ms = 0;
 
-// Tune: time after long-press before DVR is ready to accept record toggle
-static const uint16_t T_DVR_AFTER_PWRON_MS = 2500;
-
 static inline bool time_reached(uint32_t now, uint32_t deadline)
 {
     return (int32_t)(now - deadline) >= 0;
