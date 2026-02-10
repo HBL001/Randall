@@ -33,4 +33,27 @@
 // -----------------------------------------------------------------------------
 #define T_DVR_PRESS_SHORT_MS        500    
 #define T_DVR_PRESS_LONG_MS        3000    
-#define T_DVR_PRESS_GAP_MS          500    
+#define T_DVR_PRESS_GAP_MS          500
+#define T_DVR_AFTER_PWRON_MS        2500    
+
+// -----------------------------------------------------------------------------
+// DVR LED timing classifier thresholds  [INPUT SIDE]
+// -----------------------------------------------------------------------------
+
+// just sitting there idle
+#define T_SOLID_MS               1500    // ms without change = solid ON
+
+// slow blink (normal recording)
+#define T_SLOW_MIN_MS             700    // minimum full period (ON→ON or OFF→OFF)
+#define T_SLOW_MAX_MS            1800    // maximum full period
+
+// fast blink (error / abnormal boot)
+#define T_FAST_MIN_MS              80    // minimum full period
+#define T_FAST_MAX_MS             450    // maximum full period
+
+// Abnormal boot signature 
+#define T_ABN_SLOW_MIN_MS        1200
+#define T_ABN_SLOW_MAX_MS        3200
+#define T_ABN_OFF_MIN_MS          800
+#define T_ABN_BLINK_BURST_MS     2000   // manual: slow blink for 2 seconds
+#define T_ABN_SHUTOFF_MS         5000   // manual: shuts off after 5 seconds

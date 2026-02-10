@@ -3,8 +3,6 @@
 // - SHORT press: [T_BTN_SHORT_MIN_MS .. T_BTN_GRACE_MS) => power-on if needed else toggle record
 // - GRACE hold:  [T_BTN_GRACE_MS .. T_BTN_NUCLEAR_MS)   => power-off (long shutter) if powered
 // - NUCLEAR:     >= T_BTN_NUCLEAR_MS                   => ignore in software (hardware LTC wins)
-
-//
 //   SMOKE: short->power-on/toggle, grace-hold->power-off, nuclear ignored PRESS ms=283 Action: DVR POWER ON (LONG press) DVR presumed ready after wait. 
 //   PRESS ms=251 Action: DVR TOGGLE (SHORT press) 
 //   PRESS ms=244 Action: DVR TOGGLE (SHORT press) 
