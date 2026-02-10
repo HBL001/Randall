@@ -1,22 +1,6 @@
 #include "dvr_ctrl.h"
+#include "timings.h"
 
-// ---- defaults (compile-safe if timings.h not included here) ----
-#ifndef DVR_CTRL_DEFAULT_SHORT_MS
-#define DVR_CTRL_DEFAULT_SHORT_MS 120u
-#endif
-
-#ifndef DVR_CTRL_DEFAULT_LONG_MS
-#define DVR_CTRL_DEFAULT_LONG_MS 1500u
-#endif
-
-#ifndef DVR_CTRL_DEFAULT_BOOT_MS
-// If your spec has T_DVR_BOOT_PRESS_MS, you can pass that into cfg.boot_press_ms.
-#define DVR_CTRL_DEFAULT_BOOT_MS 1500u
-#endif
-
-#ifndef DVR_CTRL_DEFAULT_GUARD_MS
-#define DVR_CTRL_DEFAULT_GUARD_MS 250u
-#endif
 
 // Internal stepper states (opaque to callers; dvr_ctrl_t stores uint8_t step)
 typedef enum {
@@ -81,17 +65,11 @@ void dvr_ctrl_init(dvr_ctrl_t* self,
 {
     if (!self) return;
 
-    self->cfg.press_short_ms = cfg ? cfg->press_short_ms : DVR_CTRL_DEFAULT_SHORT_MS;
-    self->cfg.press_long_ms  = cfg ? cfg->press_long_ms  : DVR_CTRL_DEFAULT_LONG_MS;
-    self->cfg.boot_press_ms  = cfg ? cfg->boot_press_ms  : DVR_CTRL_DEFAULT_BOOT_MS;
-    self->cfg.guard_ms       = cfg ? cfg->guard_ms       : DVR_CTRL_DEFAULT_GUARD_MS;
-
-    // sane fallbacks
-    if (self->cfg.press_short_ms < 20u) self->cfg.press_short_ms = DVR_CTRL_DEFAULT_SHORT_MS;
-    if (self->cfg.press_long_ms  < 200u) self->cfg.press_long_ms  = DVR_CTRL_DEFAULT_LONG_MS;
-    if (self->cfg.boot_press_ms  < 200u) self->cfg.boot_press_ms  = self->cfg.press_long_ms;
-    if (self->cfg.guard_ms       < 10u)  self->cfg.guard_ms       = DVR_CTRL_DEFAULT_GUARD_MS;
-
+    self->cfg.press_short_ms = cfg ? cfg->press_short_ms : T_DVR_PRESS_SHORT_MS;
+    self->cfg.press_long_ms  = cfg ? cfg->press_long_ms  : T_DVR_PRESS_LONG_MS;
+    self->cfg.boot_press_ms  = cfg ? cfg->boot_press_ms  : T_DVR_BOOT_PRESS_MS;
+    self->cfg.guard_ms       = cfg ? cfg->guard_ms       : T_DVR_PRESS_GAP_MS;
+  
     self->btn_set = btn_set;
     self->on_done = on_done;
     self->user = user;
