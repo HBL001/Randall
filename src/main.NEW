@@ -1,0 +1,193 @@
+// main.cpp
+//
+// FINAL (production-style) main for Randall firmware
+// - Owns setup() + loop()
+//
+// Decision: power_mgr is the SINGLE source of EV_BTN_* events.
+// Do not init/poll button.* in this build.
+//
+// Event flow:
+//   producers -> event_queue -> (dvr_session on LED events) -> controller_fsm -> action_queue -> executor
+//
+// Notes:
+// - Keep Serial optional. If you want it silent, set CFG_SERIAL_DEBUG=0 in config.h (or comment out).
+// - This file assumes the modules exist and are correct; it does not “smoke test” anything.
+
+#include <Arduino.h>
+
+#include "config.h"
+#include "pins.h"
+#include "enums.h"
+
+#include "event_queue.h"
+#include "action_queue.h"
+
+#include "executor.h"
+#include "power_mgr.h"
+#include "fuel_gauge.h"
+#include "dvr_led.h"
+#include "dvr_session.h"
+#include "controller_fsm.h"
+#include "ui_policy.h"
+
+#ifndef CFG_SERIAL_DEBUG
+#define CFG_SERIAL_DEBUG 1
+#endif
+
+// -----------------------------------------------------------------------------
+// Minimal change-only telemetry (safe for production; cheap; can be disabled)
+// -----------------------------------------------------------------------------
+#if CFG_SERIAL_DEBUG
+static controller_state_t s_last_state = (controller_state_t)0xFF;
+static dvr_led_pattern_t  s_last_led   = (dvr_led_pattern_t)0xFF;
+static battery_state_t    s_last_bat   = (battery_state_t)0xFF;
+static error_code_t       s_last_err   = (error_code_t)0xFF;
+
+static const __FlashStringHelper* state_name(controller_state_t s)
+{
+    switch (s) {
+        case STATE_OFF:       return F("OFF");
+        case STATE_BOOTING:   return F("BOOTING");
+        case STATE_IDLE:      return F("IDLE");
+        case STATE_RECORDING: return F("RECORDING");
+        case STATE_LOW_BAT:   return F("LOW_BAT");
+        case STATE_ERROR:     return F("ERROR");
+        case STATE_LOCKOUT:   return F("LOCKOUT");
+        default:              return F("?");
+    }
+}
+
+static const __FlashStringHelper* led_name(dvr_led_pattern_t p)
+{
+    switch (p) {
+        case DVR_LED_UNKNOWN:       return F("UNKNOWN");
+        case DVR_LED_OFF:           return F("OFF");
+        case DVR_LED_SOLID:         return F("SOLID");
+        case DVR_LED_SLOW_BLINK:    return F("SLOW");
+        case DVR_LED_FAST_BLINK:    return F("FAST");
+        case DVR_LED_ABNORMAL_BOOT: return F("ABNORMAL");
+        default:                    return F("?");
+    }
+}
+
+static const __FlashStringHelper* bat_name(battery_state_t b)
+{
+    switch (b) {
+        case BAT_UNKNOWN:  return F("UNKNOWN");
+        case BAT_FULL:     return F("FULL");
+        case BAT_HALF:     return F("HALF");
+        case BAT_LOW:      return F("LOW");
+        case BAT_CRITICAL: return F("CRITICAL");
+        default:           return F("?");
+    }
+}
+
+static const __FlashStringHelper* err_name(error_code_t e)
+{
+    switch (e) {
+        case ERR_NONE:                   return F("NONE");
+        case ERR_DVR_BOOT_TIMEOUT:       return F("DVR_BOOT_TIMEOUT");
+        case ERR_DVR_ABNORMAL_BOOT:      return F("DVR_ABNORMAL_BOOT");
+        case ERR_DVR_CARD_ERROR:         return F("DVR_CARD_ERROR");
+        case ERR_BAT_CRITICAL:           return F("BAT_CRITICAL");
+        case ERR_BAT_LOCKOUT:            return F("BAT_LOCKOUT");
+        case ERR_ILLEGAL_STATE:          return F("ILLEGAL_STATE");
+        case ERR_UNEXPECTED_EVENT:       return F("UNEXPECTED_EVENT");
+        case ERR_UNEXPECTED_LED_PATTERN: return F("UNEXPECTED_LED_PATTERN");
+        default:                         return F("?");
+    }
+}
+
+static void print_status_if_changed(uint32_t now_ms)
+{
+    const controller_state_t s = controller_fsm_state();
+    const dvr_led_pattern_t  p = controller_fsm_dvr_led_pattern();
+    const battery_state_t    b = controller_fsm_battery_state();
+    const error_code_t       e = controller_fsm_error();
+
+    bool changed = false;
+    if (s != s_last_state) { s_last_state = s; changed = true; }
+    if (p != s_last_led)   { s_last_led   = p; changed = true; }
+    if (b != s_last_bat)   { s_last_bat   = b; changed = true; }
+    if (e != s_last_err)   { s_last_err   = e; changed = true; }
+
+    if (changed) {
+        Serial.print(F("t=")); Serial.print(now_ms);
+        Serial.print(F(" STATE=")); Serial.print(state_name(s));
+        Serial.print(F(" DVR="));   Serial.print(led_name(p));
+        Serial.print(F(" BAT="));   Serial.print(bat_name(b));
+        Serial.print(F(" ERR="));   Serial.println(err_name(e));
+    }
+}
+#endif
+
+// -----------------------------------------------------------------------------
+// setup / loop
+// -----------------------------------------------------------------------------
+void setup()
+{
+#if CFG_SERIAL_DEBUG
+    Serial.begin(115200);
+    delay(50);
+    Serial.println();
+    Serial.println(F("Randall firmware start (production main)"));
+#endif
+
+    // Hardware pins first
+    pins_init();
+
+    // Queues
+    eventq_init();
+    actionq_init();
+
+    // Actuation (consumes actions; includes ACT_LTC_KILL_* handling if patched)
+    executor_init();
+
+    // Interfaces / producers
+    power_mgr_init();    // INT# ISR + KILL control + emits EV_BTN_* + EV_LTC_INT_*
+    fuel_gauge_init();   // ADC -> EV_BAT_* + lockout events
+    dvr_led_init();      // LED classifier -> EV_DVR_LED_PATTERN_CHANGED
+
+    // Policy / orchestration / control
+    dvr_session_init();  // consumes LED changes (we feed it from events)
+    ui_policy_init();    // pure mapping module (used by FSM when wired)
+    controller_fsm_init();
+
+#if CFG_SERIAL_DEBUG
+    print_status_if_changed(millis());
+    Serial.println(F("Ready."));
+#endif
+}
+
+void loop()
+{
+    const uint32_t now_ms = millis();
+
+    // 1) Poll producers (ISR-backed modules can still need quiet-time / timeout logic)
+    power_mgr_poll(now_ms);
+    fuel_gauge_poll(now_ms);
+    dvr_led_poll(now_ms);
+
+    // 2) Drain events: feed DVR session first (for LED events), then FSM
+    event_t e;
+    while (eventq_pop(&e))
+    {
+        if (e.id == EV_DVR_LED_PATTERN_CHANGED)
+        {
+            dvr_session_on_led(e.t_ms, (dvr_led_pattern_t)(e.arg0 & 0xFF));
+        }
+
+        controller_fsm_on_event(&e);
+    }
+
+    // 3) Time-based state machines
+    controller_fsm_poll(now_ms);
+    dvr_session_poll(now_ms);
+
+    // 4) Execute actions (LED/BEEP/DVR press/KILL)
+    executor_poll(now_ms);
+
+#if CFG_SERIAL_DEBUG
+    print_status_if_changed(now_ms);
+#endif
+}

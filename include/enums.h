@@ -1,5 +1,4 @@
 // enums.h
-
 #pragma once
 #include <stdint.h>
 
@@ -10,16 +9,16 @@
 enum event_id_t : uint8_t
 {
     EV_NONE = 0,
-    EV_LTC_INT_ASSERTED,          
-    EV_LTC_INT_DEASSERTED,        
-    EV_BTN_SHORT_PRESS,     
-    EV_BTN_LONG_PRESS,      
-    EV_DVR_LED_PATTERN_CHANGED,   
-    EV_BAT_STATE_CHANGED,         
-    EV_BAT_LOCKOUT_ENTER,         
-    EV_BAT_LOCKOUT_EXIT,          
-    EV_DVR_LED_EDGE_ON,           
-    EV_DVR_LED_EDGE_OFF           
+    EV_LTC_INT_ASSERTED,
+    EV_LTC_INT_DEASSERTED,
+    EV_BTN_SHORT_PRESS,
+    EV_BTN_LONG_PRESS,
+    EV_DVR_LED_PATTERN_CHANGED,
+    EV_BAT_STATE_CHANGED,
+    EV_BAT_LOCKOUT_ENTER,
+    EV_BAT_LOCKOUT_EXIT,
+    EV_DVR_LED_EDGE_ON,
+    EV_DVR_LED_EDGE_OFF
 };
 
 enum event_source_t : uint8_t
@@ -111,14 +110,17 @@ enum error_code_t : uint8_t
 // =============================================================================
 // 4) OUTPUT PLANE: Actions emitted by the FSM (executed by actuator layer)
 // =============================================================================
+//
+// NOTE (Option A canonicalisation):
+// - Executor owns ONLY LED + BEEP + LTC kill outputs.
+// - DVR gesture control is owned by dvr_ctrl (direct calls), so no ACT_DVR_* here.
+//
 
 enum action_id_t : uint8_t
 {
     ACT_NONE = 0,
     ACT_BEEP,               // param: beep_pattern_t (arg0)
-    ACT_LED_PATTERN,        // param: led_pattern_t (arg0)
-    ACT_DVR_PRESS_SHORT,    // executor generates non-blocking press waveform
-    ACT_DVR_PRESS_LONG,
+    ACT_LED_PATTERN,        // param: led_pattern_t  (arg0)
     ACT_LTC_KILL_ASSERT,    // assert KILL# (cut power)
     ACT_LTC_KILL_DEASSERT,  // normally keep deasserted; included for completeness
     ACT_CLEAR_PENDING,      // clear pending flags / reset classifier buffers
@@ -139,8 +141,8 @@ enum beep_pattern_t : uint8_t
 
 enum led_pattern_t : uint8_t
 {
-    LED_NONE = 0,
-    LED_OFF,
+    // IMPORTANT: keep LED_OFF == 0 to avoid semantic/numeric drift.
+    LED_OFF = 0,
     LED_SOLID,
     LED_SLOW_BLINK,
     LED_FAST_BLINK,
