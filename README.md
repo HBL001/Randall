@@ -9,8 +9,6 @@ The firmware:
 * Enforces **safe power-up, recording, and shutdown** sequencing
 * Implements a strict **event-driven state machine** with explicit timeouts
 
-The purpose is to transform a **state-opaque, unreliable consumer camera** into a **predictable embedded subsystem** suitable for battery-powered and fault-sensitive applications.
-
 Simple bare-metal approach ~1K of SRAM
 
 ---
