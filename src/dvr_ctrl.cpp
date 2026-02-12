@@ -1,14 +1,12 @@
 #include <dvr_ctrl.h>
 #include <timings.h>
 
-
 // Internal stepper states (opaque to callers; dvr_ctrl_t stores uint8_t step)
 typedef enum {
     DVR_CTRL_STEP_IDLE = 0,
     DVR_CTRL_STEP_ASSERT,
     DVR_CTRL_STEP_HOLD,
-    DVR_CTRL_STEP_RELEASE,
-    DVR_CTRL_STEP_GUARD
+    DVR_CTRL_STEP_RELEASE
 } dvr_ctrl_step_t;
 
 static dvr_ctrl_req_result_t req_busy(void) {
@@ -39,9 +37,9 @@ static void start_gesture(dvr_ctrl_t* self,
                           bool do_state_update,
                           dvr_ctrl_assumed_state_t next_state)
 {
-    // Enforce guard window
+    // Guard window is enforced independent of busy state.
+    // If we are inside guard, caller gets BUSY (deterministic retry).
     if (now_ms < self->t_guard_until_ms) {
-        // Still in guard, treat as busy (caller can retry deterministically)
         return;
     }
 
@@ -69,7 +67,7 @@ void dvr_ctrl_init(dvr_ctrl_t* self,
     self->cfg.press_long_ms  = cfg ? cfg->press_long_ms  : T_DVR_PRESS_LONG_MS;
     self->cfg.boot_press_ms  = cfg ? cfg->boot_press_ms  : T_DVR_BOOT_PRESS_MS;
     self->cfg.guard_ms       = cfg ? cfg->guard_ms       : T_DVR_PRESS_GAP_MS;
-  
+
     self->btn_set = btn_set;
     self->on_done = on_done;
     self->user = user;
@@ -124,8 +122,8 @@ void dvr_ctrl_abort(dvr_ctrl_t* self)
     self->active_hold_ms = 0;
     self->pending_state_update = false;
 
-    // Best-effort guard: without now_ms in signature we can't do this perfectly.
-    // Use t_deadline_ms as an approximation (may be stale but avoids immediate re-press).
+    // Conservative guard: block immediate re-press.
+    // Without now_ms in signature, use the best proxy we have.
     self->t_guard_until_ms = self->t_deadline_ms + (uint32_t)self->cfg.guard_ms;
     self->t_deadline_ms = self->t_guard_until_ms;
 }
@@ -160,23 +158,22 @@ void dvr_ctrl_tick(dvr_ctrl_t* self, uint32_t now_ms)
         break;
 
     case DVR_CTRL_STEP_RELEASE:
+        // Release the button
         if (self->btn_set) {
             (void)self->btn_set(false);
         }
         self->btn_asserted = false;
 
-        // Apply assumed state update at gesture completion
+        // Apply assumed state update at gesture completion (release)
         if (self->pending_state_update) {
             self->assumed = self->pending_next_state;
             self->pending_state_update = false;
         }
 
-        self->step = (uint8_t)DVR_CTRL_STEP_GUARD;
+        // Arm guard from RELEASE time
         self->t_guard_until_ms = now_ms + (uint32_t)self->cfg.guard_ms;
-        self->t_deadline_ms = self->t_guard_until_ms;
-        break;
 
-    case DVR_CTRL_STEP_GUARD:
+        // Gesture is now complete at waveform level
         self->busy = false;
         self->step = (uint8_t)DVR_CTRL_STEP_IDLE;
 
@@ -200,13 +197,17 @@ dvr_ctrl_req_result_t dvr_request_power_on(dvr_ctrl_t* self, uint32_t now_ms)
 {
     if (!self) return req_rejected();
 
+    // If gesture in-flight, busy.
     if (self->busy) return req_busy();
 
-    // Idempotent: if already on (idle or recording), accept as no-op.
+    // Idempotent NOOP must bypass guard
     if (self->assumed == DVR_CTRL_ASSUME_ON_IDLE ||
         self->assumed == DVR_CTRL_ASSUME_ON_RECORDING) {
         return req_accepted(true);
     }
+
+    // Guard applies only to starting a real gesture
+    if (now_ms < self->t_guard_until_ms) return req_busy();
 
     // schedule boot long-press gesture; assumed -> ON_IDLE
     start_gesture(self, now_ms, "power_on", self->cfg.boot_press_ms,
@@ -229,6 +230,9 @@ dvr_ctrl_req_result_t dvr_request_toggle_record(dvr_ctrl_t* self, uint32_t now_m
         return req_rejected();
     }
 
+    // Guard applies to starting a real gesture
+    if (now_ms < self->t_guard_until_ms) return req_busy();
+
     // toggle short press; flip assumed state
     dvr_ctrl_assumed_state_t next =
         (self->assumed == DVR_CTRL_ASSUME_ON_RECORDING) ?
@@ -249,10 +253,13 @@ dvr_ctrl_req_result_t dvr_request_power_off(dvr_ctrl_t* self, uint32_t now_ms)
 
     if (self->busy) return req_busy();
 
-    // Idempotent: if already off, accept as no-op.
+    // Idempotent NOOP must bypass guard
     if (self->assumed == DVR_CTRL_ASSUME_OFF) {
         return req_accepted(true);
     }
+
+    // Guard applies only to starting a real gesture
+    if (now_ms < self->t_guard_until_ms) return req_busy();
 
     // schedule long-press power-off; assumed -> OFF
     start_gesture(self, now_ms, "power_off", self->cfg.press_long_ms,

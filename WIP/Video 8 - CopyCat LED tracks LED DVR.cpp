@@ -1,29 +1,23 @@
 /*
-  DVR status mirror
+  DVR status mirror (matches dvr_led module style)
 
   Hardware:
   - D3 (INT1)  = READ_DVR (LOW = DVR LED ON)
   - D6         = Test/status LED
   - D5         = Buzzer via 2N7002K
-
-  Behaviour:
-  - Status LED mirrors DVR LED state
-  - Buzzer follows DVR LED ON state
 */
 
 #include <Arduino.h>
-#include <avr/interrupt.h>
 
 static constexpr uint8_t PIN_READ_DVR = 3;  // D3 / INT1
 static constexpr uint8_t PIN_LED      = 6;  // Status LED
 static constexpr uint8_t PIN_BUZZER   = 5;  // Buzzer MOSFET gate
 
-volatile uint8_t g_update = 0;
+static volatile uint8_t g_dirty = 0;
 
-// INT1 ISR: flag only
-ISR(INT1_vect)
+static void isr_dvr_change()
 {
-  g_update = 1;
+  g_dirty = 1;
 }
 
 void setup()
@@ -37,32 +31,21 @@ void setup()
 
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("DVR status mirror running"));
+  Serial.println(F("DVR status mirror running (attachInterrupt)"));
 
-  // INT1 on CHANGE (both edges)
-  cli();
-  EICRA &= ~(_BV(ISC11) | _BV(ISC10));
-  EICRA |=  (_BV(ISC10));         // 01 = any logical change
-  EIFR  |=  _BV(INTF1);           // clear pending
-  EIMSK |=  _BV(INT1);            // enable INT1
-  sei();
-
-  g_update = 1;                   // force initial sync
+  attachInterrupt(digitalPinToInterrupt(PIN_READ_DVR), isr_dvr_change, CHANGE);
+  g_dirty = 1; // force initial sync
 }
 
 void loop()
 {
-  if (!g_update)
-    return;
-
-  cli();
-  g_update = 0;
-  sei();
+  if (!g_dirty) return;
+  g_dirty = 0;
 
   // READ_DVR is inverted by NPN:
   // LOW  = DVR LED ON
   // HIGH = DVR LED OFF
-  bool dvrLedOn = (digitalRead(PIN_READ_DVR) == LOW);
+  const bool dvrLedOn = (digitalRead(PIN_READ_DVR) == LOW);
 
   digitalWrite(PIN_LED,    dvrLedOn ? HIGH : LOW);
   digitalWrite(PIN_BUZZER, dvrLedOn ? HIGH : LOW);
