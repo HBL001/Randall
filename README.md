@@ -29,8 +29,6 @@ This repo contains the firmware and supporting headers that implement the Randal
 * **User feedback** (status LED + beep/haptic patterns)
 * **Safety shutdown** flow that stops recording then asserts **KILL#** for hard power cut via the power-path controller
 
-> The architecture is deliberately conservative: the DVR is treated as an *untrusted black box*, so the controller only assumes state when it has an LED-derived classification (or a defined timeout).
-
 ---
 
 ## Hardware assumptions
