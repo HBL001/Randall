@@ -1,97 +1,146 @@
 // dvr_led.cpp
 //
-//  - Use Arduino attachInterrupt() on PIN_DVR_STAT (INT1 on Nano / ATmega328P)
-//  - NEVER alias blink into OFF<->SOLID 
-//  - Robust, low-compute classification using edge COUNT over a rolling window
+// Production DVR LED classifier for Randall
+//
+//  - Uses Arduino attachInterrupt() on PIN_DVR_STAT (INT1 on Nano / ATmega328P)
+//  - LOW = DVR LED ON (per your NPN mirror)
+//  - Edge-timestamp ring buffer (micros) => robust periods/duty even if loop jitters
+//  - Sticky blink: once in blink, never overwritten by OFF/SOLID until truly quiet
+//  - Classification uses timings.h thresholds (period + optional edge bounds)
+//
+// Public API:
+//  - dvr_led_init()
+//  - dvr_led_poll(now_ms)
+//  - dvr_led_get_pattern()
 
 #include <Arduino.h>
+
 #include <dvr_led.h>
 #include <pins.h>
 #include <timings.h>
 #include <enums.h>
 
-static const uint16_t DVR_LED_GLITCH_MS = 5;   // reject <5ms edges (noise / ringing)
+// -----------------------------------------------------------------------------
+// Local hygiene only (NOT a system timing constant)
+// -----------------------------------------------------------------------------
+static const uint16_t DVR_LED_GLITCH_US = 3000; // reject edges closer than 3ms
 
 // -----------------------------------------------------------------------------
-// ISR-driven edge accounting
+// ISR ring buffer (timestamps + level-after-edge)
 // -----------------------------------------------------------------------------
-static volatile uint8_t s_isr_edge_count = 0;  // saturating count of CHANGE edges
-static volatile uint8_t s_isr_dirty = 0;       // "something happened" hint
+static const uint8_t QN = 32;                  // power-of-two recommended
+static volatile uint32_t s_q_ts_us[QN];
+static volatile uint8_t  s_q_lvl[QN];
+static volatile uint8_t  s_q_w = 0;
+static volatile uint8_t  s_q_r = 0;
+
+static volatile uint32_t s_last_isr_us = 0;
 
 static void dvr_led_isr_change()
 {
-    // Count edges 
-    if (s_isr_edge_count != 0xFFu)
-        s_isr_edge_count++;
+    const uint32_t now_us = micros();
+    const uint32_t dt_us  = now_us - s_last_isr_us;
+    if (dt_us < DVR_LED_GLITCH_US)
+        return;
 
-    s_isr_dirty = 1;
+    s_last_isr_us = now_us;
+
+    const uint8_t w = s_q_w;
+    const uint8_t w_next = (uint8_t)((w + 1u) & (QN - 1u));
+    if (w_next == s_q_r)
+        return; // overflow => drop (rare, but safe)
+
+    s_q_ts_us[w]  = now_us;
+    s_q_lvl[w]    = (uint8_t)digitalRead(PIN_DVR_STAT); // level AFTER edge
+    s_q_w         = w_next;
 }
 
-static inline uint8_t fetch_and_clear_edges_isr()
+static bool pop_edge(uint32_t &ts_us, uint8_t &lvl_after)
 {
-    uint8_t n;
     noInterrupts();
-    n = s_isr_edge_count;
-    s_isr_edge_count = 0;
-    s_isr_dirty = 0;
+    if (s_q_r == s_q_w)
+    {
+        interrupts();
+        return false;
+    }
+    const uint8_t r = s_q_r;
+    ts_us     = s_q_ts_us[r];
+    lvl_after = s_q_lvl[r];
+    s_q_r     = (uint8_t)((r + 1u) & (QN - 1u));
     interrupts();
-    return n;
+    return true;
+}
+
+static inline void clear_queue()
+{
+    noInterrupts();
+    s_q_r = s_q_w;
+    interrupts();
 }
 
 // -----------------------------------------------------------------------------
-// State
+// Internal classifier state
 // -----------------------------------------------------------------------------
 static dvr_led_pattern_t s_pat = DVR_LED_UNKNOWN;
 
-// Raw level tracking
-static uint8_t  s_level = HIGH;              // last sampled level at poll time
-static uint32_t s_last_edge_ms = 0;          // last accepted edge time
-static uint32_t s_last_level_change_ms = 0;  // for glitch reject
+static uint8_t  s_level = HIGH;        // last sampled instantaneous level
+static uint32_t s_last_edge_ms = 0;    // last accepted edge time (ms, for quiet-time)
+static uint32_t s_prev_edge_us = 0;    // previous edge timestamp (us)
+static uint8_t  s_prev_level = HIGH;   // level held BEFORE current edge
 
-// Rolling window for blink classification
-static uint32_t s_win_start_ms = 0;
-static uint16_t s_win_edges = 0;             // accepted edges in current window (not ISR count)
+// For full-period (same-phase) timing
+static uint32_t s_last_on_us  = 0;     // last transition into ON (LOW)
+static uint32_t s_last_off_us = 0;     // last transition into OFF (HIGH)
 
-// Boot marker (kept for future abnormal-boot signature work)
-static uint32_t s_boot_start_ms = 0;
+// Last measured durations (ms) (optional for debugging / future use)
+static uint16_t s_last_on_dur_ms  = 0;
+static uint16_t s_last_off_dur_ms = 0;
+static uint16_t s_last_period_ms  = 0;
 
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
-static inline uint16_t u16_sat_add(uint16_t a, uint16_t b)
+// Hysteresis: require consecutive confirmations before switching blink state
+static uint8_t s_slow_hits = 0;
+static uint8_t s_fast_hits = 0;
+
+static inline uint16_t u16_sat(uint32_t v)
 {
-    uint32_t s = (uint32_t)a + (uint32_t)b;
-    return (s > 0xFFFFu) ? 0xFFFFu : (uint16_t)s;
+    return (v > 0xFFFFu) ? 0xFFFFu : (uint16_t)v;
 }
 
-static inline void reset_window(uint32_t now_ms)
+static inline bool in_blink(dvr_led_pattern_t p)
 {
-    s_win_start_ms = now_ms;
-    s_win_edges = 0;
+    return (p == DVR_LED_SLOW_BLINK) || (p == DVR_LED_FAST_BLINK);
 }
 
-// Estimate the blink period (ms) using edges observed over window duration.
-// Each full cycle yields ~2 edges (rising+falling). We use integer math.
-static inline uint16_t estimate_period_ms(uint32_t win_dt_ms, uint16_t edges)
+static inline bool in_range_u16(uint16_t v, uint16_t lo, uint16_t hi)
 {
-    if (edges < 4) return 0;                 // need >=2 cycles to be confident
-    uint16_t cycles = (uint16_t)(edges / 2); // floor
-    if (cycles == 0) return 0;
-    return (uint16_t)(win_dt_ms / cycles);
+    return (v >= lo) && (v <= hi);
 }
 
-// Classify based on estimated period only (robust).
-// Your detailed per-edge min/max checks were the source of aliasing/missed evidence.
-// If you later want duty-cycle checks, add them as a SECONDARY filter, not primary.
-static inline dvr_led_pattern_t classify_by_period(uint16_t period_ms)
+static inline dvr_led_pattern_t classify_from_measurements(uint16_t period_ms,
+                                                          uint16_t on_dur_ms,
+                                                          uint16_t off_dur_ms)
 {
-    if (period_ms == 0) return DVR_LED_UNKNOWN;
-
-    if (period_ms >= T_FAST_MIN_MS && period_ms <= T_FAST_MAX_MS)
+    // Primary: period gates the class
+    if (in_range_u16(period_ms, T_FAST_MIN_MS, T_FAST_MAX_MS))
+    {
+        // Optional duty checks (kept tolerant): only apply if both edges non-zero
+        if (on_dur_ms && off_dur_ms)
+        {
+            if (!in_range_u16(on_dur_ms,  T_FAST_EDGE_MIN_MS, T_FAST_EDGE_MAX_MS)) return DVR_LED_UNKNOWN;
+            if (!in_range_u16(off_dur_ms, T_FAST_EDGE_MIN_MS, T_FAST_EDGE_MAX_MS)) return DVR_LED_UNKNOWN;
+        }
         return DVR_LED_FAST_BLINK;
+    }
 
-    if (period_ms >= T_SLOW_MIN_MS && period_ms <= T_SLOW_MAX_MS)
+    if (in_range_u16(period_ms, T_SLOW_MIN_MS, T_SLOW_MAX_MS))
+    {
+        if (on_dur_ms && off_dur_ms)
+        {
+            if (!in_range_u16(on_dur_ms,  T_SLOW_EDGE_MIN_MS, T_SLOW_EDGE_MAX_MS)) return DVR_LED_UNKNOWN;
+            if (!in_range_u16(off_dur_ms, T_SLOW_EDGE_MIN_MS, T_SLOW_EDGE_MAX_MS)) return DVR_LED_UNKNOWN;
+        }
         return DVR_LED_SLOW_BLINK;
+    }
 
     return DVR_LED_UNKNOWN;
 }
@@ -99,121 +148,156 @@ static inline dvr_led_pattern_t classify_by_period(uint16_t period_ms)
 void dvr_led_init(void)
 {
     pinMode(PIN_DVR_STAT, INPUT);
-
-    // Use the Arduino core interrupt plumbing (matches your working mirror test).
     attachInterrupt(digitalPinToInterrupt(PIN_DVR_STAT), dvr_led_isr_change, CHANGE);
 
-    const uint32_t now = millis();
+    const uint32_t now_ms = millis();
 
     s_pat = DVR_LED_UNKNOWN;
 
     s_level = (uint8_t)digitalRead(PIN_DVR_STAT);
-    s_last_edge_ms = now;
-    s_last_level_change_ms = now;
+    s_last_edge_ms = now_ms;
 
-    reset_window(now);
+    s_prev_level = s_level;
+    s_prev_edge_us = micros();
 
-    s_boot_start_ms = now;
+    s_last_on_us  = 0;
+    s_last_off_us = 0;
 
-    // clear ISR counters
-    fetch_and_clear_edges_isr();
+    s_last_on_dur_ms = 0;
+    s_last_off_dur_ms = 0;
+    s_last_period_ms = 0;
+
+    s_slow_hits = 0;
+    s_fast_hits = 0;
+
+    clear_queue();
 }
 
 void dvr_led_poll(uint32_t now_ms)
 {
-    // Always sample instantaneous level for stable SOLID/OFF classification.
-    const uint8_t level = (uint8_t)digitalRead(PIN_DVR_STAT);
+    // Always sample instantaneous level for SOLID/OFF decisions
+    const uint8_t level_now = (uint8_t)digitalRead(PIN_DVR_STAT);
+    s_level = level_now;
 
-    // Pull and clear edge count since last poll (atomic).
-    const uint8_t edges = fetch_and_clear_edges_isr();
+    // Drain all queued edges; compute real on/off durations and same-phase periods
+    uint32_t ts_us;
+    uint8_t lvl_after;
 
-    // -----------------------------------------------------------------------------
-    // Edge acceptance / glitch reject
-    //
-    // Important: We do NOT try to timestamp every edge in the ISR.
-    // We only need to know "edges happened" and keep a stable rolling count.
-    // -----------------------------------------------------------------------------
-    if (edges > 0)
+    bool saw_edge = false;
+
+    while (pop_edge(ts_us, lvl_after))
     {
-        // Only accept edges if enough time has passed since last level change.
-        // This rejects ringing / micro-glitches that can come from the mirror transistor.
-        const uint32_t dt = now_ms - s_last_level_change_ms;
-        if (dt >= DVR_LED_GLITCH_MS)
+        saw_edge = true;
+        s_last_edge_ms = now_ms;
+
+        // Adjacent-edge duration: s_prev_level was held until this edge
+        const uint32_t held_us = ts_us - s_prev_edge_us;
+        const uint16_t held_ms = u16_sat(held_us / 1000u);
+
+        if (s_prev_level == LOW)  s_last_on_dur_ms  = held_ms; // LED was ON
+        else                      s_last_off_dur_ms = held_ms; // LED was OFF
+
+        // Update previous-edge tracking
+        s_prev_edge_us = ts_us;
+        s_prev_level   = lvl_after;
+
+        // Same-phase period: successive ON-edges or OFF-edges
+        const bool led_on_now = (lvl_after == LOW);
+
+        if (led_on_now)
         {
-            // Update last-edge time and rolling evidence
-            s_last_edge_ms = now_ms;
-            s_last_level_change_ms = now_ms;
-
-            // Accumulate edges into the classification window
-            s_win_edges = u16_sat_add(s_win_edges, (uint16_t)edges);
-
-            // Update sampled level (phase) so stable classification later uses the latest value.
-            s_level = level;
-
-            // If window gets too long, reset it (prevents stale averages).
-            // We base this on existing constants only.
-            const uint32_t win_dt = now_ms - s_win_start_ms;
-
-            // If we've been accumulating for "too long" without locking a period,
-            // restart the window. Use slow max as a stable upper scale.
-            if (win_dt > (uint32_t)T_SLOW_MAX_MS * 4u)
-                reset_window(now_ms);
-
-            // Attempt blink classification if we have enough evidence.
-            // Use the window duration for period estimate.
-            const uint32_t win_dt2 = now_ms - s_win_start_ms;
-            const uint16_t per = estimate_period_ms(win_dt2, s_win_edges);
-            const dvr_led_pattern_t bp = classify_by_period(per);
-
-            if (bp != DVR_LED_UNKNOWN)
+            if (s_last_on_us != 0)
             {
-                // Publish blink pattern and keep window running (it will continue to confirm).
-                s_pat = bp;
+                const uint16_t per_ms = u16_sat((ts_us - s_last_on_us) / 1000u);
+                s_last_period_ms = per_ms;
 
-                // Optional: once classified, you can shorten reactivity by resetting the window
-                // so the next estimate tracks changes quickly. This also reduces latency.
-                reset_window(now_ms);
+                const dvr_led_pattern_t bp =
+                    classify_from_measurements(per_ms, s_last_on_dur_ms, s_last_off_dur_ms);
+
+                if (bp == DVR_LED_SLOW_BLINK)
+                {
+                    if (s_slow_hits < 255) s_slow_hits++;
+                    s_fast_hits = 0;
+                }
+                else if (bp == DVR_LED_FAST_BLINK)
+                {
+                    if (s_fast_hits < 255) s_fast_hits++;
+                    s_slow_hits = 0;
+                }
+                else
+                {
+                    // Transitional oddities (e.g. stop-record flash) reset confidence
+                    s_slow_hits = 0;
+                    s_fast_hits = 0;
+                }
+
+                // Require 2 hits to change blink state (hysteresis)
+                if (s_slow_hits >= 2) s_pat = DVR_LED_SLOW_BLINK;
+                if (s_fast_hits >= 2) s_pat = DVR_LED_FAST_BLINK;
             }
-
-            // CRITICAL BEHAVIOUR:
-            // While edges are happening, DO NOT overwrite s_pat with OFF/SOLID based on phase.
-            // That was the root cause of OFF<->SOLID spam during blink.
+            s_last_on_us = ts_us;
         }
         else
         {
-            // Glitch-like edge burst: ignore, but still update sampled level.
-            // (Level sampling is cheap; this avoids staying stale.)
-            s_level = level;
+            if (s_last_off_us != 0)
+            {
+                const uint16_t per_ms = u16_sat((ts_us - s_last_off_us) / 1000u);
+                s_last_period_ms = per_ms;
+
+                const dvr_led_pattern_t bp =
+                    classify_from_measurements(per_ms, s_last_on_dur_ms, s_last_off_dur_ms);
+
+                if (bp == DVR_LED_SLOW_BLINK)
+                {
+                    if (s_slow_hits < 255) s_slow_hits++;
+                    s_fast_hits = 0;
+                }
+                else if (bp == DVR_LED_FAST_BLINK)
+                {
+                    if (s_fast_hits < 255) s_fast_hits++;
+                    s_slow_hits = 0;
+                }
+                else
+                {
+                    s_slow_hits = 0;
+                    s_fast_hits = 0;
+                }
+
+                if (s_slow_hits >= 2) s_pat = DVR_LED_SLOW_BLINK;
+                if (s_fast_hits >= 2) s_pat = DVR_LED_FAST_BLINK;
+            }
+            s_last_off_us = ts_us;
         }
-    }
-    else
-    {
-        // No edges observed this poll; still keep last sampled level.
-        s_level = level;
+
+        // NOTE: While edges are flowing, we never overwrite blink with SOLID/OFF here.
+        // Blink is sticky until quiet-time says blink ended.
     }
 
-    // -----------------------------------------------------------------------------
-    // Quiet-time classification (true stable states)
-    // -----------------------------------------------------------------------------
+    // Quiet-time classification: only when genuinely quiet
     const uint32_t quiet_ms = now_ms - s_last_edge_ms;
 
-    if (quiet_ms >= (uint32_t)T_SOLID_MS)
+    if (!in_blink(s_pat))
     {
-        // Truly stable: classify as SOLID or OFF based on level.
-        // Remember: LOW = LED ON.
-        if (level == LOW)
-            s_pat = DVR_LED_SOLID;
-        else
-            s_pat = DVR_LED_OFF;
-
-        // Reset blink evidence now that we're stable again.
-        reset_window(now_ms);
+        if (quiet_ms >= (uint32_t)T_SOLID_MS)
+        {
+            s_pat = (s_level == LOW) ? DVR_LED_SOLID : DVR_LED_OFF;
+            s_slow_hits = 0;
+            s_fast_hits = 0;
+        }
+        return;
     }
 
-    // -----------------------------------------------------------------------------
-    // Abnormal boot signature placeholder
-    // -----------------------------------------------------------------------------
-    (void)s_boot_start_ms;
+    // If we *were* blinking, only drop to SOLID/OFF after a long quiet.
+    // Use T_SOLID_MS + T_SLOW_MAX_MS as "blink has definitely stopped".
+    if (quiet_ms >= (uint32_t)T_SOLID_MS + (uint32_t)T_SLOW_MAX_MS)
+    {
+        s_pat = (s_level == LOW) ? DVR_LED_SOLID : DVR_LED_OFF;
+        s_slow_hits = 0;
+        s_fast_hits = 0;
+        return;
+    }
+
+    (void)saw_edge; // reserved for future debug
 }
 
 dvr_led_pattern_t dvr_led_get_pattern(void)

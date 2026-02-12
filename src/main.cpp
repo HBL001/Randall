@@ -1,300 +1,471 @@
 /*
- * test_dvr_ctrl_smoke.cpp  (Arduino / PlatformIO)
- *
- * Purpose: Smoke-test dvr_ctrl gesture scheduler on real hardware with Serial
- * and a real GPIO output for the PhotoMOS SSR drive (D7 / PD7).
- *
- * What it verifies (minimum):
- *  - init releases the button output
- *  - long press waveform occurs once with correct hold time
- *  - short press waveform occurs once with correct hold time
- *  - BUSY / REJECT / NOOP logic behaves
- *  - guard window blocks immediate re-press
- *
- * Wiring:
- *  - Leave your real SSR connected if you want, but safest is to scope D7 first.
- *
- * Build:
- *  - Put this file in src/ and set it as the main sketch (or temporarily replace main.cpp).
- */
+    SMOKE TEST: Button-driven DVR lifecycle with VERIFIED dvr_led module
+    + STOP settle-time measurement (so we can set sane timeouts, not 17s guesses)
+
+    Sequence (user button = LTC INT# on D2):
+      1) SHORT press  -> DVR POWER ON (LONG shutter press) -> wait SOLID
+      2) SHORT press  -> DVR TOGGLE (SHORT press) -> wait SLOW_BLINK (recording)
+      3) SHORT press  -> DVR TOGGLE (SHORT press) -> wait SOLID (idle)  [MEASURE settle time]
+      4) GRACE hold   -> DVR POWER OFF (LONG press) -> wait OFF (FAST_BLINK allowed)
+
+    Notes:
+      - INT0 (D2) = LTC INT# used as the user button source.
+      - DVR LED monitoring is owned by dvr_led.cpp (INT1). DO NOT define INT1 ISR here.
+      - Uses ONLY existing identifiers from pins.h/timings.h/enums.h/... (no new global macros).
+*/
 
 #include <Arduino.h>
-#include <timings.h>
-#include <dvr_ctrl.h>
-#include <dvr_led.h>
 
+#include "config.h"
+#include "pins.h"
+#include "timings.h"
+#include "enums.h"
+#include "event_queue.h"
+#include "action_queue.h"
+#include "executor.h"
+#include "dvr_led.h"
 
-// -----------------------------
-// Pin mapping (matches your architecture)
-// -----------------------------
-#ifndef PIN_DVR_BTN_CMD
-#define PIN_DVR_BTN_CMD 7   // Arduino D7 == PD7
+// ----------------------------------------------------------------------------
+// Time helper
+// ----------------------------------------------------------------------------
+static inline bool time_reached(uint32_t now, uint32_t deadline)
+{
+    return (int32_t)(now - deadline) >= 0;
+}
+
+// ----------------------------------------------------------------------------
+// Action enqueue helpers
+// ----------------------------------------------------------------------------
+static inline void enqueue_beep(uint32_t now, beep_pattern_t pat)
+{
+    action_t a;
+    a.t_enq_ms = now;
+    a.id       = ACT_BEEP;
+    a.arg0     = (uint16_t)pat;
+    a.arg1     = 0;
+    actionq_push(&a);
+}
+
+static inline void enqueue_dvr_short(uint32_t now)
+{
+    action_t a;
+    a.t_enq_ms = now;
+    a.id       = ACT_DVR_PRESS_SHORT;
+    a.arg0     = 0;
+    a.arg1     = 0;
+    actionq_push(&a);
+}
+
+static inline void enqueue_dvr_long(uint32_t now)
+{
+    action_t a;
+    a.t_enq_ms = now;
+    a.id       = ACT_DVR_PRESS_LONG;
+    a.arg0     = 0;
+    a.arg1     = 0;
+    actionq_push(&a);
+}
+
+// ============================================================================
+// INT0 (LTC INT#) -> press measurement (user button semantics)
+// ============================================================================
+static volatile uint8_t s_last_int0_level = 1;
+
+static bool     g_btn_down = false;
+static uint32_t g_btn_down_ms = 0;
+
+static void isr_ltc_int_change()
+{
+    const uint8_t level = (uint8_t)digitalRead(PIN_LTC_INT_N);
+    if (level == s_last_int0_level) return;
+    s_last_int0_level = level;
+
+    event_t e;
+    e.t_ms   = millis();
+    e.src    = SRC_LTC;
+    e.reason = (level == LTC_INT_ASSERT_LEVEL) ? EVR_EDGE_FALL : EVR_EDGE_RISE;
+    e.arg0   = (uint16_t)level;
+    e.arg1   = 0;
+    e.id     = (level == LTC_INT_ASSERT_LEVEL) ? EV_LTC_INT_ASSERTED : EV_LTC_INT_DEASSERTED;
+
+    eventq_push_isr(&e);
+}
+
+static bool consume_press_ms(uint32_t *out_press_ms)
+{
+    event_t ev;
+    while (eventq_pop(&ev))
+    {
+        if (ev.id == EV_LTC_INT_ASSERTED)
+        {
+            g_btn_down = true;
+            g_btn_down_ms = ev.t_ms;
+        }
+        else if (ev.id == EV_LTC_INT_DEASSERTED && g_btn_down)
+        {
+            const uint32_t press_ms = ev.t_ms - g_btn_down_ms;
+            g_btn_down = false;
+            g_btn_down_ms = 0;
+
+            if (press_ms < T_BTN_SHORT_MIN_MS)
+                return false;
+
+            *out_press_ms = press_ms;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// DVR LED reporting (dvr_led module)
+// ============================================================================
+static dvr_led_pattern_t s_last_pat = DVR_LED_UNKNOWN;
+
+static void print_dvr_pattern(dvr_led_pattern_t p)
+{
+#if CFG_DEBUG_SERIAL
+    Serial.print(F("DVR LED PATTERN -> "));
+    switch (p)
+    {
+        case DVR_LED_OFF:           Serial.println(F("OFF")); break;
+        case DVR_LED_SOLID:         Serial.println(F("SOLID")); break;
+        case DVR_LED_SLOW_BLINK:    Serial.println(F("SLOW_BLINK")); break;
+        case DVR_LED_FAST_BLINK:    Serial.println(F("FAST_BLINK")); break;
+        case DVR_LED_ABNORMAL_BOOT: Serial.println(F("ABNORMAL_BOOT")); break;
+        case DVR_LED_UNKNOWN:
+        default:                    Serial.println(F("UNKNOWN")); break;
+    }
+#else
+    (void)p;
+#endif
+}
+
+static inline dvr_led_pattern_t dvr_pat_now(uint32_t now)
+{
+    dvr_led_poll(now);
+    return dvr_led_get_pattern();
+}
+
+static void dvr_led_report_poll(uint32_t now)
+{
+    const dvr_led_pattern_t p = dvr_pat_now(now);
+    if (p != s_last_pat)
+    {
+        s_last_pat = p;
+        print_dvr_pattern(p);
+    }
+}
+
+// ============================================================================
+// Smoke sequencer with LED-gated readiness checks
+// + STOP settle time measurement (wait SOLID stable for T_SOLID_MS)
+// ============================================================================
+typedef enum
+{
+    STEP_WAIT_PWRON = 0,
+    STEP_WAIT_READY_SOLID,      // after power-on command: wait SOLID
+    STEP_WAIT_START_REC,        // wait user short, send start, then wait SLOW_BLINK
+    STEP_WAIT_REC_SLOW,         // waiting for SLOW_BLINK confirmation
+    STEP_WAIT_STOP_REC,         // wait user short, send stop, then wait SOLID stable (measure)
+    STEP_WAIT_IDLE_SOLID,       // waiting for SOLID stable (measure settle)
+    STEP_WAIT_PWROFF,           // wait user grace, send off, then wait OFF
+    STEP_WAIT_OFF,              // waiting for OFF confirmation
+    STEP_DONE
+} smoke_step_t;
+
+static smoke_step_t s_step = STEP_WAIT_PWRON;
+static uint32_t     s_deadline_ms = 0;
+
+// STOP settle measurement
+static uint32_t     s_stop_t0_ms = 0;
+static uint32_t     s_solid_since_ms = 0;
+
+static inline void arm_wait(uint32_t now, uint32_t wait_ms)
+{
+    s_deadline_ms = now + wait_ms;
+}
+
+static inline bool wait_expired(uint32_t now)
+{
+    return time_reached(now, s_deadline_ms);
+}
+
+static inline void fail_and_halt(const __FlashStringHelper *msg)
+{
+#if CFG_DEBUG_SERIAL
+    Serial.print(F("SMOKE FAIL: "));
+    Serial.println(msg);
+#endif
+    enqueue_beep(millis(), BEEP_DOUBLE);
+    s_step = STEP_DONE;
+}
+
+void setup()
+{
+#if CFG_DEBUG_SERIAL
+    Serial.begin(115200);
+    delay(200);
 #endif
 
-// -----------------------------
-// Simple assert helpers
-// -----------------------------
-static uint16_t g_fail_count = 0;
+    pins_init();
+    eventq_init();
+    actionq_init();
+    executor_init();
 
-static void test_fail(const __FlashStringHelper* msg) {
-  g_fail_count++;
-  Serial.print(F("FAIL: "));
-  Serial.println(msg);
+    dvr_led_init();
+
+    // INT0 for LTC INT#
+    s_last_int0_level = (uint8_t)digitalRead(PIN_LTC_INT_N);
+    attachInterrupt(digitalPinToInterrupt(PIN_LTC_INT_N), isr_ltc_int_change, CHANGE);
+
+#if CFG_DEBUG_SERIAL
+    Serial.println(F("SMOKE: short->ON(wait SOLID), short->START(wait SLOW), short->STOP(measure -> SOLID stable), grace->OFF(wait OFF)."));
+#endif
 }
 
-static void test_pass(const __FlashStringHelper* msg) {
-  Serial.print(F("PASS: "));
-  Serial.println(msg);
-}
+void loop()
+{
+    const uint32_t now = millis();
 
-static void expect_true(bool cond, const __FlashStringHelper* msg) {
-  if (!cond) test_fail(msg);
-  else test_pass(msg);
-}
+    executor_poll(now);
+    dvr_led_report_poll(now);
 
-// -----------------------------
-// Capture waveform events
-// -----------------------------
-struct EdgeLog {
-  uint32_t t_ms;
-  bool asserted;
-};
+    // --- State-driven waiting on DVR LED confirmations ---
 
-static EdgeLog g_edges[16];
-static uint8_t g_edge_count = 0;
-static bool g_last_asserted = false;
+    if (s_step == STEP_WAIT_READY_SOLID)
+    {
+        const dvr_led_pattern_t p = dvr_led_get_pattern();
+        if (p == DVR_LED_SOLID)
+        {
+#if CFG_DEBUG_SERIAL
+            Serial.println(F("READY: DVR LED is SOLID."));
+#endif
+            s_step = STEP_WAIT_START_REC;
+            return;
+        }
 
-static void log_edge(uint32_t now_ms, bool asserted) {
-  if (g_edge_count < (uint8_t)(sizeof(g_edges) / sizeof(g_edges[0]))) {
-    g_edges[g_edge_count++] = { now_ms, asserted };
-  }
-  Serial.print(F("EDGE t="));
-  Serial.print(now_ms);
-  Serial.print(F("ms  asserted="));
-  Serial.println(asserted ? F("1") : F("0"));
-}
-
-static void reset_edge_log(void) {
-  g_edge_count = 0;
-}
-
-// -----------------------------
-// dvr_ctrl callbacks
-// -----------------------------
-static bool btn_set_cb(bool asserted) {
-  uint32_t now_ms = millis();
-
-  // Drive actual pin
-  digitalWrite(PIN_DVR_BTN_CMD, asserted ? HIGH : LOW);
-
-  // Log only on transitions (so we can measure hold)
-  if (asserted != g_last_asserted) {
-    g_last_asserted = asserted;
-    log_edge(now_ms, asserted);
-  }
-
-  return true; // hardware accepted
-}
-
-static void on_done_cb(void* /*user*/, const char* gesture_name) {
-  Serial.print(F("DONE: "));
-  Serial.println(gesture_name ? gesture_name : "null");
-}
-
-// -----------------------------
-// Test harness utils
-// -----------------------------
-static dvr_ctrl_t g_ctrl;
-
-static bool run_until_idle(uint32_t timeout_ms) {
-  uint32_t start = millis();
-  while ((millis() - start) < timeout_ms) {
-    dvr_ctrl_tick(&g_ctrl, millis());
-    if (!dvr_ctrl_is_busy(&g_ctrl)) {
-      return true;
+        if (wait_expired(now))
+        {
+            fail_and_halt(F("timeout waiting for SOLID after power-on"));
+            return;
+        }
+        return;
     }
-    // keep loop responsive
-    delay(1);
-  }
-  return false;
-}
 
-static int32_t measured_hold_ms(void) {
-  // Expect one assert edge then one release edge.
-  // Log contains transitions only; so for a gesture we want:
-  //   edges[0] asserted=1
-  //   edges[1] asserted=0
-  if (g_edge_count < 2) return -1;
-  if (!g_edges[0].asserted) return -2;
-  if (g_edges[1].asserted)  return -3;
-  return (int32_t)(g_edges[1].t_ms - g_edges[0].t_ms);
-}
+    if (s_step == STEP_WAIT_REC_SLOW)
+    {
+        const dvr_led_pattern_t p = dvr_led_get_pattern();
+        if (p == DVR_LED_SLOW_BLINK)
+        {
+#if CFG_DEBUG_SERIAL
+            Serial.println(F("CONFIRMED: DVR is RECORDING (SLOW_BLINK)."));
+#endif
+            s_step = STEP_WAIT_STOP_REC;
+            return;
+        }
 
-static void print_req(const char* name, dvr_ctrl_req_result_t r) {
-  Serial.print(name);
-  Serial.print(F(": status="));
-  Serial.print((int)r.status);
-  Serial.print(F(" noop="));
-  Serial.println(r.noop ? F("1") : F("0"));
-}
+        if (p == DVR_LED_FAST_BLINK)
+        {
+            fail_and_halt(F("FAST_BLINK seen while expecting recording"));
+            return;
+        }
 
-// -----------------------------
-// Smoke tests
-// -----------------------------
-static void test_1_init_releases(void) {
-  Serial.println(F("\n=== TEST 1: init releases output ==="));
+        if (wait_expired(now))
+        {
+            fail_and_halt(F("timeout waiting for SLOW_BLINK after start"));
+            return;
+        }
+        return;
+    }
 
-  // Ensure pin is configured
-  pinMode(PIN_DVR_BTN_CMD, OUTPUT);
-  digitalWrite(PIN_DVR_BTN_CMD, LOW);
-  g_last_asserted = false;
-  reset_edge_log();
+    // STOP measurement wait:
+    // We require SOLID to persist for T_SOLID_MS (stable), then print settle time.
+    if (s_step == STEP_WAIT_IDLE_SOLID)
+    {
+        const dvr_led_pattern_t p = dvr_led_get_pattern();
 
-  // Use canonical timings as defaults; allow overrides later if desired
-  dvr_ctrl_cfg_t cfg = {};
-  cfg.press_short_ms = T_DVR_PRESS_SHORT_MS;
-  cfg.press_long_ms  = T_DVR_PRESS_LONG_MS;
-  cfg.boot_press_ms  = T_DVR_PRESS_LONG_MS;     // boot == long press (your current policy)
-  cfg.guard_ms       = T_DVR_PRESS_GAP_MS;      // guard == inter-press gap
+        if (p == DVR_LED_SOLID)
+        {
+            if (s_solid_since_ms == 0)
+                s_solid_since_ms = now;
 
-  dvr_ctrl_init(&g_ctrl, &cfg, btn_set_cb, on_done_cb, nullptr);
+            if (time_reached(now, s_solid_since_ms + (uint32_t)T_SOLID_MS))
+            {
+#if CFG_DEBUG_SERIAL
+                const uint32_t settle_ms = now - s_stop_t0_ms;
+                Serial.print(F("STOP settle_ms="));
+                Serial.println(settle_ms);
+                Serial.println(F("CONFIRMED: DVR is IDLE (SOLID stable)."));
+#endif
+                s_step = STEP_WAIT_PWROFF;
+                return;
+            }
+        }
+        else
+        {
+            s_solid_since_ms = 0;
+        }
 
-  expect_true(!dvr_ctrl_is_busy(&g_ctrl), F("ctrl not busy after init"));
-  expect_true(digitalRead(PIN_DVR_BTN_CMD) == LOW, F("DVR button output released (LOW)"));
-}
+        if (wait_expired(now))
+        {
+            fail_and_halt(F("timeout waiting for SOLID after stop"));
+            return;
+        }
+        return;
+    }
 
-static void test_2_illegal_toggle_rejected(void) {
-  Serial.println(F("\n=== TEST 2: toggle rejected when assumed OFF ==="));
-  dvr_ctrl_set_assumed_state(&g_ctrl, DVR_CTRL_ASSUME_OFF);
+    if (s_step == STEP_WAIT_OFF)
+    {
+        const dvr_led_pattern_t p = dvr_led_get_pattern();
+        if (p == DVR_LED_OFF)
+        {
+#if CFG_DEBUG_SERIAL
+            Serial.println(F("CONFIRMED: DVR is OFF."));
+#endif
+            s_step = STEP_DONE;
+            return;
+        }
 
-  dvr_ctrl_req_result_t r = dvr_request_toggle_record(&g_ctrl, millis());
-  print_req("toggle_record", r);
+        // FAST_BLINK during shutdown is acceptable; ignore it
+        if (wait_expired(now))
+        {
+            fail_and_halt(F("timeout waiting for OFF after power-off"));
+            return;
+        }
+        return;
+    }
 
-  expect_true(r.status == DVR_CTRL_REQ_REJECTED, F("toggle rejected when OFF"));
-  expect_true(!dvr_ctrl_is_busy(&g_ctrl), F("still not busy after rejected request"));
-}
+    // --- Otherwise, we are waiting for a user press ---
+    uint32_t press_ms = 0;
+    if (!consume_press_ms(&press_ms))
+        return;
 
-static void test_3_power_on_long_press_waveform(void) {
-  Serial.println(F("\n=== TEST 3: power_on generates one long press ==="));
+#if CFG_DEBUG_SERIAL
+    Serial.print(F("PRESS ms="));
+    Serial.println(press_ms);
+#endif
 
-  dvr_ctrl_set_assumed_state(&g_ctrl, DVR_CTRL_ASSUME_OFF);
-  reset_edge_log();
+    if (press_ms >= T_BTN_NUCLEAR_MS)
+    {
+#if CFG_DEBUG_SERIAL
+        Serial.println(F("NUCLEAR hold: ignored (LTC hardware will cut power)."));
+#endif
+        return;
+    }
 
-  uint32_t now = millis();
-  dvr_ctrl_req_result_t r = dvr_request_power_on(&g_ctrl, now);
-  print_req("power_on", r);
+    const bool is_grace = (press_ms >= T_BTN_GRACE_MS);
 
-  expect_true(r.status == DVR_CTRL_REQ_ACCEPTED, F("power_on accepted"));
-  expect_true(!r.noop, F("power_on not a noop"));
-  expect_true(dvr_ctrl_is_busy(&g_ctrl), F("ctrl busy after accepted power_on"));
+    // Do not enqueue while executor is busy
+    if (executor_busy())
+        return;
 
-  bool ok = run_until_idle((uint32_t)T_DVR_PRESS_LONG_MS + (uint32_t)T_DVR_PRESS_GAP_MS + 1500u);
-  expect_true(ok, F("gesture completes within timeout"));
+    switch (s_step)
+    {
+        case STEP_WAIT_PWRON:
+        {
+            if (is_grace)
+            {
+#if CFG_DEBUG_SERIAL
+                Serial.println(F("Grace hold ignored here; expecting SHORT to power on."));
+#endif
+                return;
+            }
 
-  // Basic edge sanity
-  expect_true(g_edge_count >= 2, F("observed at least assert+release edges"));
+#if CFG_DEBUG_SERIAL
+            Serial.println(F("Action: DVR POWER ON (LONG press)"));
+#endif
+            enqueue_dvr_long(now);
+            enqueue_beep(now, BEEP_DOUBLE);
 
-  int32_t hold = measured_hold_ms();
-  Serial.print(F("Measured hold="));
-  Serial.print(hold);
-  Serial.println(F("ms"));
+            arm_wait(now, (uint32_t)T_BOOT_TIMEOUT_MS);
+            s_step = STEP_WAIT_READY_SOLID;
+            return;
+        }
 
-  // Allow modest tolerance due to millis granularity / scheduling
-  const int32_t exp = (int32_t)T_DVR_PRESS_LONG_MS;
-  const int32_t tol = 60;  // ~1-2 ticks margin + loop jitter
-  expect_true(hold >= (exp - tol) && hold <= (exp + tol), F("long press hold within tolerance"));
+        case STEP_WAIT_START_REC:
+        {
+            if (is_grace)
+            {
+#if CFG_DEBUG_SERIAL
+                Serial.println(F("Grace hold early: powering off (LONG press)"));
+#endif
+                enqueue_dvr_long(now);
+                enqueue_beep(now, BEEP_DOUBLE);
 
-  // Assumed state should have updated to ON_IDLE on completion
-  expect_true(dvr_ctrl_get_assumed_state(&g_ctrl) == DVR_CTRL_ASSUME_ON_IDLE, F("assumed state -> ON_IDLE"));
-}
+                arm_wait(now, (uint32_t)T_BOOT_TIMEOUT_MS);
+                s_step = STEP_WAIT_OFF;
+                return;
+            }
 
-static void test_4_power_on_noop(void) {
-  Serial.println(F("\n=== TEST 4: power_on becomes NOOP when already ON ==="));
+#if CFG_DEBUG_SERIAL
+            Serial.println(F("Action: DVR TOGGLE (SHORT press) -> start recording"));
+#endif
+            enqueue_dvr_short(now);
+            enqueue_beep(now, BEEP_SINGLE);
 
-  // Already ON_IDLE from previous test
-  dvr_ctrl_req_result_t r = dvr_request_power_on(&g_ctrl, millis());
-  print_req("power_on(again)", r);
+            // Wait for recording confirmation (slow blink)
+            arm_wait(now, (uint32_t)(T_SLOW_MAX_MS * 2u + T_SOLID_MS));
+            s_step = STEP_WAIT_REC_SLOW;
+            return;
+        }
 
-  expect_true(r.status == DVR_CTRL_REQ_ACCEPTED, F("power_on accepted"));
-  expect_true(r.noop, F("power_on noop when already on"));
-  expect_true(!dvr_ctrl_is_busy(&g_ctrl), F("noop does not schedule a gesture"));
-}
+        case STEP_WAIT_STOP_REC:
+        {
+            if (is_grace)
+            {
+#if CFG_DEBUG_SERIAL
+                Serial.println(F("Grace hold: powering off (LONG press)"));
+#endif
+                enqueue_dvr_long(now);
+                enqueue_beep(now, BEEP_DOUBLE);
 
-static void test_5_toggle_short_press_and_guard(void) {
-  Serial.println(F("\n=== TEST 5: toggle_record short press + guard enforcement ==="));
+                arm_wait(now, (uint32_t)T_BOOT_TIMEOUT_MS);
+                s_step = STEP_WAIT_OFF;
+                return;
+            }
 
-  // Ensure ON_IDLE
-  dvr_ctrl_set_assumed_state(&g_ctrl, DVR_CTRL_ASSUME_ON_IDLE);
+#if CFG_DEBUG_SERIAL
+            Serial.println(F("Action: DVR TOGGLE (SHORT press) -> stop recording"));
+            Serial.println(F("Waiting for SOLID stable after stop (measuring)..."));
+#endif
+            enqueue_dvr_short(now);
+            enqueue_beep(now, BEEP_SINGLE);
 
-  // Start toggle
-  reset_edge_log();
-  dvr_ctrl_req_result_t r = dvr_request_toggle_record(&g_ctrl, millis());
-  print_req("toggle_record", r);
+            // Measurement run: give a provisional budget.
+            // We'll tighten once you see STOP settle_ms in the logs.
+            arm_wait(now, (uint32_t)(T_SOLID_MS + T_SLOW_MAX_MS * 3u));
 
-  expect_true(r.status == DVR_CTRL_REQ_ACCEPTED, F("toggle accepted"));
-  expect_true(dvr_ctrl_is_busy(&g_ctrl), F("ctrl busy after toggle"));
+            s_stop_t0_ms = now;
+            s_solid_since_ms = 0;
 
-  // While busy, a second request should be BUSY
-  dvr_ctrl_req_result_t r2 = dvr_request_power_off(&g_ctrl, millis());
-  print_req("power_off(while busy)", r2);
-  expect_true(r2.status == DVR_CTRL_REQ_BUSY, F("request while busy returns BUSY"));
+            s_step = STEP_WAIT_IDLE_SOLID;
+            return;
+        }
 
-  bool ok = run_until_idle((uint32_t)T_DVR_PRESS_SHORT_MS + (uint32_t)T_DVR_PRESS_GAP_MS + 1500u);
-  expect_true(ok, F("short gesture completes within timeout"));
+        case STEP_WAIT_PWROFF:
+        {
+            if (!is_grace)
+            {
+#if CFG_DEBUG_SERIAL
+                Serial.println(F("Expect GRACE hold to power off (>=T_BTN_GRACE_MS). Short ignored."));
+#endif
+                return;
+            }
 
-  int32_t hold = measured_hold_ms();
-  Serial.print(F("Measured hold="));
-  Serial.print(hold);
-  Serial.println(F("ms"));
+#if CFG_DEBUG_SERIAL
+            Serial.println(F("Action: DVR POWER OFF (LONG press) [grace hold]"));
+#endif
+            enqueue_dvr_long(now);
+            enqueue_beep(now, BEEP_DOUBLE);
 
-  const int32_t exp = (int32_t)T_DVR_PRESS_SHORT_MS;
-  const int32_t tol = 60;
-  expect_true(hold >= (exp - tol) && hold <= (exp + tol), F("short press hold within tolerance"));
+            arm_wait(now, (uint32_t)T_BOOT_TIMEOUT_MS);
+            s_step = STEP_WAIT_OFF;
+            return;
+        }
 
-  // Immediately attempt another toggle: should be BUSY due to guard window
-  dvr_ctrl_req_result_t r3 = dvr_request_toggle_record(&g_ctrl, millis());
-  print_req("toggle(immediate after done)", r3);
-  expect_true(r3.status == DVR_CTRL_REQ_BUSY, F("guard blocks immediate re-press"));
-
-  // Wait past guard and try again: should accept
-  delay((uint32_t)T_DVR_PRESS_GAP_MS + 20u);
-  dvr_ctrl_req_result_t r4 = dvr_request_toggle_record(&g_ctrl, millis());
-  print_req("toggle(after gap)", r4);
-  expect_true(r4.status == DVR_CTRL_REQ_ACCEPTED, F("toggle accepted after guard"));
-  (void)run_until_idle((uint32_t)T_DVR_PRESS_SHORT_MS + (uint32_t)T_DVR_PRESS_GAP_MS + 1500u);
-}
-
-void setup() {
-  Serial.begin(115200);
-  while (!Serial) { /* Nano usually continues anyway */ }
-
-  Serial.println(F("\n=============================="));
-  Serial.println(F("dvr_ctrl SMOKE TEST START"));
-  Serial.println(F("=============================="));
-
-  Serial.print(F("Timings: short=")); Serial.print(T_DVR_PRESS_SHORT_MS);
-  Serial.print(F(" long=")); Serial.print(T_DVR_PRESS_LONG_MS);
-  Serial.print(F(" gap=")); Serial.print(T_DVR_PRESS_GAP_MS);
-  Serial.println(F(" (ms)"));
-
-  test_1_init_releases();
-  test_2_illegal_toggle_rejected();
-  test_3_power_on_long_press_waveform();
-  test_4_power_on_noop();
-  test_5_toggle_short_press_and_guard();
-
-  Serial.println(F("\n=============================="));
-  Serial.print(F("SMOKE TEST COMPLETE. FAILURES="));
-  Serial.println(g_fail_count);
-  Serial.println(F("=============================="));
-
-  if (g_fail_count == 0) {
-    Serial.println(F("OVERALL: PASS"));
-  } else {
-    Serial.println(F("OVERALL: FAIL"));
-  }
-}
-
-void loop() {
-  // Nothing: tests run once in setup()
+        case STEP_DONE:
+        default:
+            return;
+    }
 }

@@ -42,20 +42,25 @@
 // DVR LED timing classifier thresholds  [INPUT SIDE]
 // -----------------------------------------------------------------------------
 
-// SOLID: LED continuously ON (or OFF) with no edges
+// SOLID: LED continuously ON (or OFF) with no edges.
+// Must be > half-cycle of slow blink (~1000ms) so it doesn't fire mid-blink.
 #define T_SOLID_MS               1500    // ms without change = solid
 
 // SLOW blink (normal recording)
-#define T_SLOW_MIN_MS             700    // minimum full period (ON→ON or OFF→OFF)
-#define T_SLOW_MAX_MS            1800    // maximum full period
-#define T_SLOW_EDGE_MIN_MS        150    // minimum ON or OFF time
-#define T_SLOW_EDGE_MAX_MS       1200    // maximum ON or OFF time
+// Observed: ON≈1000, OFF≈1000, period≈2000ms.
+#define T_SLOW_MIN_MS            1700    // allow some jitter but exclude 1s junk
+#define T_SLOW_MAX_MS            2600
 
-// FAST blink (error / fault)
-#define T_FAST_MIN_MS              80    // minimum full period
-#define T_FAST_MAX_MS             450    // maximum full period
-#define T_FAST_EDGE_MIN_MS         20    // minimum ON or OFF time
-#define T_FAST_EDGE_MAX_MS        250    // maximum ON or OFF time
+#define T_SLOW_EDGE_MIN_MS        300    // comfortably above glitches / transitions
+#define T_SLOW_EDGE_MAX_MS       1400    // allows duty skew and tolerates jitter
+
+// FAST blink (error / shutdown burst)
+// Observed: ON≈100, OFF≈100, period≈200ms.
+#define T_FAST_MIN_MS             120
+#define T_FAST_MAX_MS             320
+
+#define T_FAST_EDGE_MIN_MS         40
+#define T_FAST_EDGE_MAX_MS        180
 
 // -----------------------------------------------------------------------------
 // Abnormal boot signature (reserved / documented behaviour)
