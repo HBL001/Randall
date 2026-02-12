@@ -8,8 +8,8 @@
 // - DVR press engine is non-blocking and runs concurrently with LED + BEEP.
 // - Policy: ignore new DVR press requests while one is active.
 
-#include "executor.h"
-#include "timings.h"
+#include <executor.h>
+#include <timings.h>
 
 // ----------------------------------------------------------------------------
 // Internal state (independent engines)

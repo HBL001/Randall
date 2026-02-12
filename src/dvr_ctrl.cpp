@@ -1,5 +1,5 @@
-#include "dvr_ctrl.h"
-#include "timings.h"
+#include <dvr_ctrl.h>
+#include <timings.h>
 
 
 // Internal stepper states (opaque to callers; dvr_ctrl_t stores uint8_t step)

@@ -19,6 +19,10 @@
  */
 
 #include <Arduino.h>
+#include <timings.h>
+#include <dvr_ctrl.h>
+#include <dvr_led.h>
+
 
 // -----------------------------
 // Pin mapping (matches your architecture)

@@ -1,6 +1,6 @@
 // event_queue.cpp
 
-#include "event_queue.h"
+#include <event_queue.h>
 
 // NOTE: CFG_EVENT_QUEUE_SIZE must be > 1
 static_assert(CFG_EVENT_QUEUE_SIZE > 1, "CFG_EVENT_QUEUE_SIZE must be > 1");
