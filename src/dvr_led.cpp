@@ -1,12 +1,21 @@
 // dvr_led.cpp
 //
-// Production DVR LED classifier for Randall
 //
+// What this module IS:
+//  - A *signal classifier* only: OFF / SOLID / SLOW_BLINK / FAST_BLINK / UNKNOWN
 //  - Uses Arduino attachInterrupt() on PIN_DVR_STAT (INT1 on Nano / ATmega328P)
 //  - LOW = DVR LED ON (per your NPN mirror)
 //  - Edge-timestamp ring buffer (micros) => robust periods/duty even if loop jitters
 //  - Sticky blink: once in blink, never overwritten by OFF/SOLID until truly quiet
 //  - Classification uses timings.h thresholds (period + optional edge bounds)
+//
+// GO and look at dvr_dvr_status for:
+//  - infer "abnormal boot" or any higher-level meaning.
+//    (e.g. RunCam microSD missing / card error). 
+//
+// IMPORTANT NOTE (RunCam semantics):
+//  - DVR_LED_FAST_BLINK is *often* used by RunCam to indicate microSD/card error.
+//    Do NOT treat FAST_BLINK as a shutdown acknowledgement. Use OFF for shutdown-complete.
 //
 // Public API:
 //  - dvr_led_init()
@@ -15,10 +24,10 @@
 
 #include <Arduino.h>
 
-#include <dvr_led.h>
-#include <pins.h>
-#include <timings.h>
-#include <enums.h>
+#include "dvr_led.h"
+#include "pins.h"
+#include "timings.h"
+#include "enums.h"
 
 // -----------------------------------------------------------------------------
 // Local hygiene only (NOT a system timing constant)
@@ -152,6 +161,7 @@ void dvr_led_init(void)
 
     const uint32_t now_ms = millis();
 
+    // Start in UNKNOWN until we've observed stability or blink cadence.
     s_pat = DVR_LED_UNKNOWN;
 
     s_level = (uint8_t)digitalRead(PIN_DVR_STAT);
@@ -183,11 +193,8 @@ void dvr_led_poll(uint32_t now_ms)
     uint32_t ts_us;
     uint8_t lvl_after;
 
-    bool saw_edge = false;
-
     while (pop_edge(ts_us, lvl_after))
     {
-        saw_edge = true;
         s_last_edge_ms = now_ms;
 
         // Adjacent-edge duration: s_prev_level was held until this edge
@@ -226,7 +233,7 @@ void dvr_led_poll(uint32_t now_ms)
                 }
                 else
                 {
-                    // Transitional oddities (e.g. stop-record flash) reset confidence
+                    // Transitional oddities reset confidence.
                     s_slow_hits = 0;
                     s_fast_hits = 0;
                 }
@@ -296,8 +303,6 @@ void dvr_led_poll(uint32_t now_ms)
         s_fast_hits = 0;
         return;
     }
-
-    (void)saw_edge; // reserved for future debug
 }
 
 dvr_led_pattern_t dvr_led_get_pattern(void)

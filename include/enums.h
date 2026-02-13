@@ -1,5 +1,4 @@
 // enums.h
-
 #pragma once
 #include <stdint.h>
 
@@ -10,16 +9,29 @@
 enum event_id_t : uint8_t
 {
     EV_NONE = 0,
-    EV_LTC_INT_ASSERTED,          
-    EV_LTC_INT_DEASSERTED,        
-    EV_BTN_SHORT_PRESS,     
-    EV_BTN_LONG_PRESS,      
-    EV_DVR_LED_PATTERN_CHANGED,   
-    EV_BAT_STATE_CHANGED,         
-    EV_BAT_LOCKOUT_ENTER,         
-    EV_BAT_LOCKOUT_EXIT,          
-    EV_DVR_LED_EDGE_ON,           
-    EV_DVR_LED_EDGE_OFF           
+
+    // Raw / physical inputs
+    EV_LTC_INT_ASSERTED,
+    EV_LTC_INT_DEASSERTED,
+    EV_BTN_SHORT_PRESS,
+    EV_BTN_LONG_PRESS,
+
+    // DVR LED observation (classifier / bridge)
+    EV_DVR_LED_PATTERN_CHANGED,   // arg0=dvr_led_pattern_t
+    EV_DVR_LED_EDGE_ON,
+    EV_DVR_LED_EDGE_OFF,
+
+    // Battery observation
+    EV_BAT_STATE_CHANGED,         // arg0=battery_state_t, arg1=adc (if you use it)
+    EV_BAT_LOCKOUT_ENTER,
+    EV_BAT_LOCKOUT_EXIT,
+
+    // Derived DVR semantic events (from LED / status discriminator)
+    EV_DVR_POWERED_ON_IDLE,
+    EV_DVR_RECORD_STARTED,
+    EV_DVR_RECORD_STOPPED,
+    EV_DVR_POWERED_OFF,
+    EV_DVR_ERROR                  // arg0=error_code_t, arg1=detail (e.g. last pattern)
 };
 
 enum event_source_t : uint8_t
@@ -28,6 +40,7 @@ enum event_source_t : uint8_t
     SRC_LTC,
     SRC_BUTTON,
     SRC_DVR_LED,
+    SRC_DVR_STATUS,   // <<< ADDED: derived semantic status from LED patterns
     SRC_BATTERY,
     SRC_FSM
 };
@@ -115,18 +128,17 @@ enum error_code_t : uint8_t
 enum action_id_t : uint8_t
 {
     ACT_NONE = 0,
-    ACT_BEEP,               // param: beep_pattern_t (arg0)
-    ACT_LED_PATTERN,        // param: led_pattern_t (arg0)
-    ACT_DVR_PRESS_SHORT,    // executor generates non-blocking press waveform
+    ACT_BEEP,               // arg0=beep_pattern_t
+    ACT_LED_PATTERN,        // arg0=led_pattern_t
+    ACT_DVR_PRESS_SHORT,
     ACT_DVR_PRESS_LONG,
-    ACT_LTC_KILL_ASSERT,    // assert KILL# (cut power)
-    ACT_LTC_KILL_DEASSERT,  // normally keep deasserted; included for completeness
-    ACT_CLEAR_PENDING,      // clear pending flags / reset classifier buffers
-    ACT_ENTER_LOCKOUT,      // latch lockout in software
+    ACT_LTC_KILL_ASSERT,
+    ACT_LTC_KILL_DEASSERT,
+    ACT_CLEAR_PENDING,
+    ACT_ENTER_LOCKOUT,
     ACT_EXIT_LOCKOUT
 };
 
-// Parameter enums for actions (keeps ACT_BEEP and ACT_LED_PATTERN auditable).
 enum beep_pattern_t : uint8_t
 {
     BEEP_NONE = 0,
@@ -148,7 +160,6 @@ enum led_pattern_t : uint8_t
     LED_ERROR_PATTERN
 };
 
-// Optional: standardized result codes for pure functions and drivers
 enum result_t : uint8_t
 {
     RET_OK = 0,
