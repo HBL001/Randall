@@ -1,3 +1,20 @@
+// dvr_led.cpp
+//
+// Rise/fall, single-cycle classifier:
+//  - Capture BOTH edges (LOW=ON, HIGH=OFF) with timestamps.
+//  - As soon as we have one ON duration and one OFF duration, compute period and classify.
+//  - Keep quiet-time logic for SOLID/OFF.
+//
+// IMPORTANT electrical assumption (as you stated / mirror test):
+//   - PIN_DVR_STAT is a mirror of DVR LED
+//   - LOW  = DVR LED ON
+//   - HIGH = DVR LED OFF
+//
+// Notes:
+//  - We timestamp edges in the ISR (micros()) so we don't lose timing if loop() is busy.
+//  - ISR writes edges into a tiny ring buffer. poll() drains it and classifies.
+//  - No new global timing constants are introduced; DVR_LED_GLITCH_MS remains local hygiene.
+
 #include <Arduino.h>
 
 #include "dvr_led.h"
@@ -6,41 +23,68 @@
 #include "enums.h"
 
 // -----------------------------------------------------------------------------
-// Assumptions (as per your mirror test / spec):
-//   - PIN_DVR_STAT is connected to a mirror of the DVR LED.
-//   - LOW  = DVR LED ON
-//   - HIGH = DVR LED OFF
+// Local hygiene: glitch reject for sniffer input edges (ms)
 // -----------------------------------------------------------------------------
-
-// Debounce/glitch reject for edges on the sniffer input (ms).
-// This is NOT a new "timing constant" in your global system; it's local hygiene.
-// Keep it small so it doesn't mask real FAST blink edges.
 static const uint16_t DVR_LED_GLITCH_MS = 5;
 
-// ISR flag: "we saw at least one change since last poll"
-static volatile uint8_t s_dvr_dirty = 0;
+// -----------------------------------------------------------------------------
+// Edge ring buffer (ISR -> poll)
+// -----------------------------------------------------------------------------
+typedef struct {
+    uint32_t t_us;     // micros timestamp at edge
+    uint8_t  level;    // sampled pin level AFTER the change (0=LOW, 1=HIGH)
+} dvr_led_edge_t;
+
+static const uint8_t EDGEQ_N = 8;
+static volatile dvr_led_edge_t s_edgeq[EDGEQ_N];
+static volatile uint8_t s_edgeq_w = 0;
+static volatile uint8_t s_edgeq_r = 0;
 
 // Last classified pattern exposed to the rest of the system
 static dvr_led_pattern_t s_pat = DVR_LED_UNKNOWN;
 
 // Raw signal tracking
-static uint8_t  s_level = 1;             // last sampled level (1=HIGH/off, 0=LOW/on)
-static uint32_t s_last_edge_ms = 0;       // time of last accepted edge
-static uint32_t s_last_level_change_ms = 0;
+static uint8_t  s_level = 1;                // last known level (1=HIGH/off, 0=LOW/on)
 
-// Duration tracking (ms)
-static uint16_t s_last_on_ms  = 0;        // most recent LOW duration
-static uint16_t s_last_off_ms = 0;        // most recent HIGH duration
-static uint16_t s_last_period_ms = 0;     // on+off for a full cycle when we have it
-
-// For "abnormal boot" placeholder: we keep the enum but do not overfit the rule
-// without your exact signature logic wired in. You can extend later.
+// Timestamp tracking
+static uint32_t s_last_edge_ms = 0;         // last accepted edge time in ms (for quiet-time)
 static uint32_t s_boot_start_ms = 0;
 
-// Arduino ISR trampoline
+// Duration tracking (ms)
+static uint16_t s_last_on_ms     = 0;       // LOW duration
+static uint16_t s_last_off_ms    = 0;       // HIGH duration
+static uint16_t s_last_period_ms = 0;       // on+off once both known
+
+// For duration calculation: record the start time of current level
+static uint32_t s_level_start_us = 0;       // micros() when current s_level began
+
+// -----------------------------------------------------------------------------
+// Fast pin read in ISR
+// -----------------------------------------------------------------------------
+static inline uint8_t fastReadPin(uint8_t pin)
+{
+    uint8_t bit = digitalPinToBitMask(pin);
+    uint8_t port = digitalPinToPort(pin);
+    volatile uint8_t *in = portInputRegister(port);
+    return ((*in & bit) ? 1u : 0u);
+}
+
+// Arduino ISR trampoline (INT1 on Nano = D3)
 static void dvr_led_isr_change()
 {
-    s_dvr_dirty = 1;
+    const uint32_t t = micros();
+    const uint8_t  lvl = fastReadPin(PIN_DVR_STAT);
+
+    uint8_t w = s_edgeq_w;
+    uint8_t w_next = (uint8_t)((w + 1u) % EDGEQ_N);
+
+    // Drop edge on overflow (better than corrupting indices)
+    if (w_next == s_edgeq_r)
+        return;
+
+    s_edgeq[w].t_us  = t;
+    s_edgeq[w].level = lvl;
+    s_edgeq_w = w_next;
 }
 
 static inline dvr_led_pattern_t classify_period(uint16_t period_ms,
@@ -66,111 +110,130 @@ void dvr_led_init(void)
 {
     pinMode(PIN_DVR_STAT, INPUT);
 
-    // INT1 = D3 on ATmega328P/Nano
+    // INT1 = D3 on ATmega328P/Nano (your prior build uses this)
     attachInterrupt(digitalPinToInterrupt(PIN_DVR_STAT), dvr_led_isr_change, CHANGE);
 
-    s_dvr_dirty = 0;
+    // Reset edge queue
+    noInterrupts();
+    s_edgeq_w = 0;
+    s_edgeq_r = 0;
+    interrupts();
+
     s_pat = DVR_LED_UNKNOWN;
 
+    const uint32_t now_ms = millis();
+    const uint32_t now_us = micros();
+
     s_level = (uint8_t)digitalRead(PIN_DVR_STAT);
-    const uint32_t now = millis();
-    s_last_edge_ms = now;
-    s_last_level_change_ms = now;
+    s_level_start_us = now_us;
+
+    s_last_edge_ms = now_ms;
 
     s_last_on_ms = 0;
     s_last_off_ms = 0;
     s_last_period_ms = 0;
 
-    s_boot_start_ms = now;
+    s_boot_start_ms = now_ms;
+}
+
+static inline bool edgeq_pop(dvr_led_edge_t *out)
+{
+    bool ok = false;
+
+    noInterrupts();
+    uint8_t r = s_edgeq_r;
+    if (r != s_edgeq_w)
+    {
+        *out = s_edgeq[r];
+        s_edgeq_r = (uint8_t)((r + 1u) % EDGEQ_N);
+        ok = true;
+    }
+    interrupts();
+
+    return ok;
 }
 
 void dvr_led_poll(uint32_t now_ms)
 {
-    // Always sample level (needed for SOLID/OFF quiet-time classification)
-    const uint8_t level = (uint8_t)digitalRead(PIN_DVR_STAT);
+    // Always sample current level for quiet-time logic
+    const uint8_t level_now = (uint8_t)digitalRead(PIN_DVR_STAT);
 
-    // -------------------------------------------------------------------------
-    // Edge processing: if ISR flagged dirty, consume it by examining pin level.
-    // We do NOT rely on edge timestamps from ISR; we use poll time for ms-level
-    // decoding (your thresholds are ms-scale).
-    // -------------------------------------------------------------------------
-    if (s_dvr_dirty)
+    // Drain all pending edges captured by ISR
+    dvr_led_edge_t e;
+    while (edgeq_pop(&e))
     {
-        s_dvr_dirty = 0;
+        const uint8_t new_level = (uint8_t)(e.level & 1u);
 
-        // If the level hasn't actually changed, ignore (spurious ISR wake)
-        if (level != s_level)
+        // Ignore if "edge" doesn't actually change level (shouldn’t happen, but safe)
+        if (new_level == s_level)
+            continue;
+
+        // Compute duration of the PREVIOUS level: (edge_time - level_start_time)
+        uint32_t dt_us = e.t_us - s_level_start_us;
+        uint32_t dt_ms = dt_us / 1000u;
+
+        // Glitch reject
+        if (dt_ms < (uint32_t)DVR_LED_GLITCH_MS)
         {
-            const uint32_t dt = now_ms - s_last_level_change_ms;
+            // Still update bookkeeping to avoid getting stuck on pathological chatter:
+            // move start to this time and accept new level as reality.
+            s_level = new_level;
+            s_level_start_us = e.t_us;
+            continue;
+        }
 
-            // Glitch reject: ignore edges faster than a few ms
-            if (dt >= DVR_LED_GLITCH_MS)
+        // Record duration of previous level (LOW=ON, HIGH=OFF)
+        if (s_level == LOW)
+        {
+            s_last_on_ms = (dt_ms > 0xFFFFu) ? 0xFFFFu : (uint16_t)dt_ms;
+        }
+        else
+        {
+            s_last_off_ms = (dt_ms > 0xFFFFu) ? 0xFFFFu : (uint16_t)dt_ms;
+        }
+
+        // Once we have both ON and OFF durations at least once, we have one full cycle
+        if (s_last_on_ms != 0 && s_last_off_ms != 0)
+        {
+            const uint32_t p = (uint32_t)s_last_on_ms + (uint32_t)s_last_off_ms;
+            s_last_period_ms = (p > 0xFFFFu) ? 0xFFFFu : (uint16_t)p;
+
+            const dvr_led_pattern_t per_pat =
+                classify_period(s_last_period_ms, s_last_on_ms, s_last_off_ms);
+
+            if (per_pat != DVR_LED_UNKNOWN)
             {
-                // We are transitioning AWAY from previous level; record its duration.
-                // Remember: LOW=ON, HIGH=OFF.
-                if (s_level == LOW)
-                {
-                    // Previous was ON (LOW)
-                    s_last_on_ms = (dt > 0xFFFFu) ? 0xFFFFu : (uint16_t)dt;
-                }
-                else
-                {
-                    // Previous was OFF (HIGH)
-                    s_last_off_ms = (dt > 0xFFFFu) ? 0xFFFFu : (uint16_t)dt;
-                }
-
-                // When we have both an ON and OFF duration, we have a full cycle period.
-                if (s_last_on_ms != 0 && s_last_off_ms != 0)
-                {
-                    const uint32_t p = (uint32_t)s_last_on_ms + (uint32_t)s_last_off_ms;
-                    s_last_period_ms = (p > 0xFFFFu) ? 0xFFFFu : (uint16_t)p;
-
-                    // Period-based classification takes priority over quiet-time
-                    const dvr_led_pattern_t per_pat =
-                        classify_period(s_last_period_ms, s_last_on_ms, s_last_off_ms);
-
-                    if (per_pat != DVR_LED_UNKNOWN)
-                    {
-                        s_pat = per_pat;
-                    }
-                }
-
-                // Update raw state
-                s_level = level;
-                s_last_level_change_ms = now_ms;
-                s_last_edge_ms = now_ms;
+                // Single-cycle decision: update immediately
+                s_pat = per_pat;
             }
         }
+
+        // Update raw level state to the new level, and set the new start time
+        s_level = new_level;
+        s_level_start_us = e.t_us;
+
+        // Update last edge time for quiet-time classification
+        const uint32_t edge_ms = (uint32_t)(e.t_us / 1000u);
+        s_last_edge_ms = edge_ms;
     }
 
-    // -------------------------------------------------------------------------
-    // Quiet-time classification:
-    //   - SOLID: stable LOW (LED ON) with no edges for >= T_SOLID_MS
-    //   - OFF:   stable HIGH (LED OFF) with no edges for >= T_SOLID_MS
-    //
-    // This is what makes SOLID possible even without edges.
-    // -------------------------------------------------------------------------
+    // Quiet-time classification for SOLID/OFF (no edges for >= T_SOLID_MS)
+    // This still matters, because SOLID/OFF is defined by absence of edges.
     const uint32_t quiet_ms = now_ms - s_last_edge_ms;
 
     if (quiet_ms >= (uint32_t)T_SOLID_MS)
     {
-        if (level == LOW)
+        if (level_now == LOW)
         {
-            // LED is ON continuously
             s_pat = DVR_LED_SOLID;
         }
         else
         {
-            // LED is OFF continuously
             s_pat = DVR_LED_OFF;
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Abnormal boot: keep enum available, but don't guess a signature here.
-    // You already have T_BOOT_WINDOW_MS / T_ABN_* constants; once you confirm the
-    // exact signature logic, we can promote this from UNKNOWN->ABNORMAL_BOOT.
-    // -------------------------------------------------------------------------
+    // Abnormal boot placeholder (left as-is; you can add signature logic later)
     (void)s_boot_start_ms;
 }
 
