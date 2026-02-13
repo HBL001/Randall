@@ -4,12 +4,16 @@
 //
 // Produces: EV_DVR_LED_PATTERN_CHANGED (arg0=dvr_led_pattern_t)
 //
-// Notes:
-// - dvr_led.cpp already has hysteresis for blink detection.
-// - This bridge adds a small stability filter to reduce chatter
-//   between UNKNOWN/SOLID/OFF at start-up or when wiring is noisy.
-// - No buffering: emits only on accepted changes.
+// Updated for "single-cycle" rise/fall classifier in dvr_led.cpp:
 //
+// Key changes:
+//  1) Reduce stability requirement to 1 for blink patterns (FAST/SLOW) so the app
+//     responds immediately once the classifier has one full cycle.
+//  2) Keep a small stability requirement for UNKNOWN/SOLID/OFF to suppress startup
+//     chatter and wiring noise.
+//  3) Keep rate-limit, but allow blink transitions through with minimal delay.
+//
+// No buffering: emits only on accepted changes.
 
 #include "drv_dvr_led.h"
 
@@ -22,8 +26,11 @@
 // -----------------------------------------------------------------------------
 // Module-local hygiene only (NOT global timing constants)
 // -----------------------------------------------------------------------------
-static const uint16_t kMinEmitSpacingMs = 30;   // rate-limit rapid churn
-static const uint8_t  kStableReq        = 2;    // consecutive polls to accept change
+static const uint16_t kMinEmitSpacingMs = 30;   // rate-limit rapid churn (general)
+
+// Stability requirements by class of pattern:
+static const uint8_t  kStableReqBlink   = 1;   // FAST/SLOW: respond immediately
+static const uint8_t  kStableReqQuiet   = 2;   // UNKNOWN/SOLID/OFF: suppress chatter
 
 // -----------------------------------------------------------------------------
 // Internal state
@@ -43,30 +50,34 @@ static inline bool time_reached(uint32_t now, uint32_t deadline)
     return (int32_t)(now - deadline) >= 0;
 }
 
-// If your event_t includes optional metadata fields, define these in config.h
-// (or build flags) to enable population.
-//   CFG_EVENT_HAS_SRC=1    -> event_t has .src
-//   CFG_EVENT_HAS_REASON=1 -> event_t has .reason
-#ifndef CFG_EVENT_HAS_SRC
-#define CFG_EVENT_HAS_SRC 0
-#endif
-#ifndef CFG_EVENT_HAS_REASON
-#define CFG_EVENT_HAS_REASON 0
-#endif
+static inline bool is_blink_pat(dvr_led_pattern_t p)
+{
+    return (p == DVR_LED_FAST_BLINK) || (p == DVR_LED_SLOW_BLINK);
+}
+
+static inline uint8_t stable_req_for(dvr_led_pattern_t p)
+{
+    return is_blink_pat(p) ? kStableReqBlink : kStableReqQuiet;
+}
 
 static inline void emit_led_event(uint32_t now_ms, dvr_led_pattern_t pat)
 {
     event_t e;
     e.t_ms   = now_ms;
     e.id     = EV_DVR_LED_PATTERN_CHANGED;
+
+#if CFG_EVENT_HAS_SRC
     e.src    = SRC_DVR_LED;
+#endif
+#if CFG_EVENT_HAS_REASON
     e.reason = EVR_CLASSIFIER_STABLE;
+#endif
+
     e.arg0   = (uint16_t)((uint8_t)pat);  // explicit width
     e.arg1   = 0;
 
     (void)eventq_push(&e);
 }
-
 
 // -----------------------------------------------------------------------------
 // Public API
@@ -101,14 +112,16 @@ void drv_dvr_led_poll(uint32_t now_ms)
     if (s_candidate_cnt < 255)
         s_candidate_cnt++;
 
-    if (s_candidate_cnt < kStableReq)
+    const uint8_t req = stable_req_for(s_candidate);
+    if (s_candidate_cnt < req)
         return;
 
     // Candidate is stable enough. Only emit if it differs from reported.
     if (s_candidate == s_reported)
         return;
 
-    // Rate-limit chatter
+    // Rate-limit chatter: we keep this for everything, but it effectively won't
+    // add perceptible lag because kMinEmitSpacingMs is small.
     if (!time_reached(now_ms, s_last_emit_ms + kMinEmitSpacingMs))
         return;
 

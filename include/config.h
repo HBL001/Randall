@@ -73,3 +73,11 @@
 #if CFG_ACTION_QUEUE_SIZE > 16
   #error "Action queue too large for ATmega328P"
 #endif
+
+// =============================================================================
+// Event metadata configuration
+// =============================================================================
+
+// event_t includes source and reason fields
+#define CFG_EVENT_HAS_SRC        1
+#define CFG_EVENT_HAS_REASON     1
