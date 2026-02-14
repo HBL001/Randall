@@ -4,11 +4,11 @@
 // - Polling-based edge detect + debounce (NO ISR ownership)
 // - Emits gesture events:
 //      EV_BTN_SHORT_PRESS on release if duration within [T_BTN_SHORT_MIN_MS .. T_BTN_GRACE_MS)
-//      EV_BTN_LONG_PRESS  once when held reaches T_BTN_GRACE_MS (early emit), OR on release if held >= T_BTN_GRACE_MS and not yet emitted
+//      EV_BTN_LONG_PRESS  once when held reaches T_BTN_GRACE_MS (early emit),
+//                         OR on release if held >= T_BTN_GRACE_MS and not yet emitted
 // - Optional raw edge telemetry (EV_LTC_INT_ASSERTED / EV_LTC_INT_DEASSERTED)
 //
 // Dependencies: pins.h, timings.h, enums.h, event_queue.h
-//
 
 #include <Arduino.h>
 
@@ -102,13 +102,9 @@ void button_poll(uint32_t now_ms)
 #if (CFG_BUTTON_EMIT_RAW_EDGES != 0)
             // Raw edge telemetry (debug only)
             if (is_asserted(level))
-            {
                 emit(now_ms, EV_LTC_INT_ASSERTED, SRC_LTC, EVR_EDGE_FALL, (uint16_t)level, 0);
-            }
             else
-            {
                 emit(now_ms, EV_LTC_INT_DEASSERTED, SRC_LTC, EVR_EDGE_RISE, (uint16_t)level, 0);
-            }
 #endif
 
             // Press tracking
@@ -149,9 +145,10 @@ void button_poll(uint32_t now_ms)
                     }
                 }
 
+                // Reset for next press
                 g_pressed      = false;
                 g_down_ms      = 0;
-                g_long_emitted = false; // reset for next press
+                g_long_emitted = false;
             }
         }
     }

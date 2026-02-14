@@ -5,12 +5,19 @@
 // - Emits actions into action_queue
 // - Drives presentation via ui_policy on state transitions
 //
+// Updated policy to match new canonical user story:
+// - MEGA is powered by LTC and boots first.
+// - On MEGA firmware start, we automatically boot the DVR (self-test) and keep it ON/IDLE after PASS.
+// - Single tap toggles record start/stop (DVR remains powered).
+// - Long press requests graceful DVR shutdown (stop first if recording), then waits for EV_DVR_POWERED_OFF.
+//   (Power cut / KILL# is handled by the power manager layer, not here.)
+//
 // This version integrates:
 //   - Battery critical + lockout handling
 //   - Button short/long handling
 //   - DVR semantic events (from drv_dvr_status): RECORD_STARTED/STOPPED, POWERED_ON/OFF, DVR_ERROR
 //
-// Key policy upgrades vs “optimistic” version:
+// Key policy:
 //   - Boot completion is LED-confirmed (EV_DVR_POWERED_ON_IDLE), not timer-assumed.
 //   - Recording start/stop confirmations are LED-confirmed (EV_DVR_RECORD_*).
 //   - SD-card missing / persistent FAST blink becomes EV_DVR_ERROR(ERR_DVR_CARD_ERROR) -> STATE_ERROR.
@@ -42,6 +49,10 @@ static error_code_t    s_err     = ERR_NONE;
 
 // Boot confirmation window (await EV_DVR_POWERED_ON_IDLE)
 static uint32_t        s_boot_deadline_ms = 0;
+
+// Shutdown sequencing
+static bool            s_shutdown_pending = false;   // long-hold requested
+static bool            s_stop_pending     = false;   // stop requested as part of shutdown
 
 // -----------------------------------------------------------------------------
 // Helpers: time compare
@@ -87,9 +98,8 @@ static inline void set_error(uint32_t now_ms, error_code_t err, controller_state
 }
 
 // Convenience: clear error if we are leaving ERROR-like situations
-static inline void clear_error_if(uint32_t now_ms, controller_state_t next)
+static inline void clear_error_if(controller_state_t next)
 {
-    (void)now_ms;
     if (s_err != ERR_NONE && next != STATE_ERROR && next != STATE_LOCKOUT)
         s_err = ERR_NONE;
 }
@@ -127,7 +137,8 @@ static void handle_battery_event(uint32_t now_ms, const event_t* ev)
             s_lockout = false;
             s_err     = ERR_NONE;
 
-            // Conservative: after lockout clears, go OFF; user can power on again.
+            // After lockout clears, conservative fallback to OFF.
+            // (System power behaviour is ultimately governed by LTC/power_mgr.)
             set_state(now_ms, STATE_OFF);
             return;
         }
@@ -152,25 +163,27 @@ static void handle_button_event(uint32_t now_ms, const event_t* ev)
     if (s_lockout)
         return;
 
+    // If shutdown is pending, ignore all further user input (deterministic, no buffering)
+    if (s_shutdown_pending)
+        return;
+
     switch (s_state)
     {
         case STATE_OFF:
         {
-            if (!is_short)
-                return;
-
-            // Power on request -> long press to DVR
-            act_dvr_long(now_ms);
-
-            s_err = ERR_NONE;
-            set_state(now_ms, STATE_BOOTING);
-            s_boot_deadline_ms = now_ms + (uint32_t)T_BOOT_TIMEOUT_MS;
+            // IMPORTANT CHANGE:
+            // MEGA power-up is handled by LTC hardware, not via a firmware “short press”.
+            // So in STATE_OFF, ignore button taps here.
+            //
+            // If your platform generates EV_BTN_* even while “off”, those should be
+            // ignored; actual power-on happens before firmware runs.
+            (void)now_ms;
             return;
         }
 
         case STATE_BOOTING:
         {
-            // Policy: discard taps while booting (no buffering)
+            // Policy: discard taps while booting/self-test (no buffering)
             return;
         }
 
@@ -178,18 +191,16 @@ static void handle_button_event(uint32_t now_ms, const event_t* ev)
         {
             if (is_short)
             {
-                // Request start recording; confirmation arrives from EV_DVR_RECORD_STARTED.
+                // DVR is already ON/IDLE after self-test PASS.
+                // Tap toggles into RECORDING (confirmed by EV_DVR_RECORD_STARTED).
                 act_dvr_short(now_ms);
-
-                // DO NOT transition to RECORDING yet: wait for LED-confirmation event.
-                // Keep UI minimal here; if you want a “click” you can add it in ui_policy later.
             }
             else
             {
-                // Grace/long => power off
+                // Long hold => graceful shutdown (DVR long press), then wait for EV_DVR_POWERED_OFF.
+                s_shutdown_pending = true;
                 act_dvr_long(now_ms);
-                clear_error_if(now_ms, STATE_OFF);
-                set_state(now_ms, STATE_OFF);
+                // Remain in current state until EV_DVR_POWERED_OFF arrives.
             }
             return;
         }
@@ -198,41 +209,48 @@ static void handle_button_event(uint32_t now_ms, const event_t* ev)
         {
             if (is_short)
             {
-                // Request stop recording; confirmation arrives from EV_DVR_RECORD_STOPPED.
+                // Tap toggles out of recording (confirmed by EV_DVR_RECORD_STOPPED).
                 act_dvr_short(now_ms);
             }
             else
             {
-                // Grace/long => power off
-                act_dvr_long(now_ms);
-                clear_error_if(now_ms, STATE_OFF);
-                set_state(now_ms, STATE_OFF);
+                // Long hold => stop recording first, then shutdown DVR.
+                s_shutdown_pending = true;
+                s_stop_pending     = true;
+                act_dvr_short(now_ms);   // request stop; EV_DVR_RECORD_STOPPED will trigger long shutdown
             }
             return;
         }
 
         case STATE_LOW_BAT:
         {
-            // Minimal: allow OFF via long; ignore short (prevents starting recording in low bat)
+            // In LOW_BAT, allow long for shutdown; ignore short.
             if (is_long)
             {
-                act_dvr_long(now_ms);
-                clear_error_if(now_ms, STATE_OFF);
-                set_state(now_ms, STATE_OFF);
+                s_shutdown_pending = true;
+
+                // If we are still recording for any reason, request stop first.
+                if (s_state == STATE_RECORDING)
+                {
+                    s_stop_pending = true;
+                    act_dvr_short(now_ms);
+                }
+                else
+                {
+                    act_dvr_long(now_ms);
+                }
             }
             return;
         }
 
         case STATE_ERROR:
         {
-            // In ERROR, allow user to power-off via long (escape hatch).
+            // In ERROR, allow user to attempt graceful shutdown via long.
             if (is_long)
             {
+                s_shutdown_pending = true;
                 act_dvr_long(now_ms);
-                // remain in error until DVR actually powers off (EV_DVR_POWERED_OFF),
-                // or just drop to OFF immediately (choose one). We'll drop immediately:
-                set_state(now_ms, STATE_OFF);
-                s_err = ERR_NONE;
+                // Remain in ERROR until EV_DVR_POWERED_OFF arrives; then go OFF.
             }
             return;
         }
@@ -252,24 +270,28 @@ static void handle_dvr_semantic_event(uint32_t now_ms, const event_t* ev)
     {
         case EV_DVR_POWERED_ON_IDLE:
         {
-            // Boot complete confirmation
+            // Boot/self-test complete confirmation: DVR is ON and idle (solid).
             if (s_state == STATE_BOOTING && !s_lockout)
             {
                 s_err = ERR_NONE;
                 set_state(now_ms, STATE_IDLE);
 
-                // User-story: “ready” cue
-                // (This is NOT “record confirmed”; it's boot/ready confirmed.)
-                ui_policy_on_record_confirmed(now_ms); // If you dislike this, add a dedicated hook later.
+                // Ready cue (boot/ready confirmed).
+                ui_policy_on_record_confirmed(now_ms); // existing hook; rename later if desired
             }
             return;
         }
 
         case EV_DVR_POWERED_OFF:
         {
+            // DVR has actually powered off (e.g., graceful shutdown complete)
             if (!s_lockout)
             {
-                s_err = ERR_NONE;
+                // If we were shutting down, clear pending flags now.
+                s_shutdown_pending = false;
+                s_stop_pending     = false;
+
+                clear_error_if(STATE_OFF);
                 set_state(now_ms, STATE_OFF);
             }
             return;
@@ -278,7 +300,7 @@ static void handle_dvr_semantic_event(uint32_t now_ms, const event_t* ev)
         case EV_DVR_RECORD_STARTED:
         {
             // Confirm start recording
-            if (!s_lockout)
+            if (!s_lockout && !s_shutdown_pending)
             {
                 set_state(now_ms, STATE_RECORDING);
                 ui_policy_on_record_confirmed(now_ms);
@@ -293,6 +315,13 @@ static void handle_dvr_semantic_event(uint32_t now_ms, const event_t* ev)
             {
                 set_state(now_ms, STATE_IDLE);
                 ui_policy_on_stop_confirmed(now_ms);
+
+                // If a shutdown was requested while recording, continue shutdown now.
+                if (s_shutdown_pending && s_stop_pending)
+                {
+                    s_stop_pending = false;
+                    act_dvr_long(now_ms);
+                }
             }
             return;
         }
@@ -317,14 +346,27 @@ static void handle_dvr_semantic_event(uint32_t now_ms, const event_t* ev)
 // -----------------------------------------------------------------------------
 void controller_fsm_init(void)
 {
-    s_state = STATE_OFF;
+    // IMPORTANT CHANGE:
+    // Firmware starts because LTC has already powered the MEGA.
+    // Therefore we begin in BOOTING and immediately boot the DVR for self-test.
+    s_state = STATE_BOOTING;
+
     s_bat   = BAT_UNKNOWN;
     s_lockout = false;
     s_err   = ERR_NONE;
-    s_boot_deadline_ms = 0;
+
+    s_shutdown_pending = false;
+    s_stop_pending     = false;
+
+    const uint32_t now_ms = 0;
+    s_boot_deadline_ms = now_ms + (uint32_t)T_BOOT_TIMEOUT_MS;
 
     ui_policy_init();
     ui_policy_on_state_enter(0, s_state, s_err, s_bat);
+
+    // Kick off DVR boot gesture immediately (self-test path).
+    // If a later battery event puts us into LOCKOUT/LOW_BAT, higher layers can act.
+    act_dvr_long(0);
 }
 
 void controller_fsm_poll(uint32_t now_ms)

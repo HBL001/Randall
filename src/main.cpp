@@ -1,7 +1,9 @@
 /*
-    SMOKE TEST (ARCH): controller_fsm + ui_policy + executor + drv_fuel_gauge + drv_dvr_led + drv_dvr_status
+    Randall Sport Camera Controller — main.cpp (APP)
 
-    - main.cpp is plumbing + observability only.
+    main.cpp is plumbing + optional observability only.
+
+    Architecture (runtime contract):
     - dvr_button is the ONLY producer of EV_BTN_* events (polling).
     - drv_fuel_gauge produces EV_BAT_* events (polling).
     - drv_dvr_led owns the dvr_led classifier and produces EV_DVR_LED_PATTERN_CHANGED.
@@ -9,12 +11,9 @@
     - controller_fsm consumes events and enqueues actions (using ui_policy on transitions).
     - executor consumes actions and drives LED/BEEP/DVR press engines.
 
-    Verification criteria:
-      - When we observe DVR LED FAST_BLINK (shutdown ack/animation),
-        we must observe DVR LED OFF before timeout (T_BOOT_TIMEOUT_MS).
-        If not, print FAIL.
-
-    NOTE: Do NOT pop/stash/repush the action_queue here.
+    Notes:
+    - No action_queue meddling here (executor owns it).
+    - Observability must NOT consume events unless it stashes + re-pushes.
 */
 
 #include <Arduino.h>
@@ -44,75 +43,24 @@ static inline bool time_reached(uint32_t now, uint32_t deadline)
     return (int32_t)(now - deadline) >= 0;
 }
 
-// ============================================================================
-// Shutdown signature verification (arm on FAST_BLINK -> expect OFF)
-// ============================================================================
-
-static bool              s_shutdown_armed       = false;
-static uint32_t          s_shutdown_deadline_ms = 0;
-static dvr_led_pattern_t s_last_pat_printed     = DVR_LED_UNKNOWN;
-
-static void print_dvr_pattern(dvr_led_pattern_t p)
-{
 #if CFG_DEBUG_SERIAL
-    Serial.print(F("DVR LED PATTERN -> "));
+// ============================================================================
+// Debug helpers (serial only)
+// ============================================================================
+
+static const __FlashStringHelper* dvr_pat_str(dvr_led_pattern_t p)
+{
     switch (p)
     {
-        case DVR_LED_OFF:           Serial.println(F("OFF")); break;
-        case DVR_LED_SOLID:         Serial.println(F("SOLID")); break;
-        case DVR_LED_SLOW_BLINK:    Serial.println(F("SLOW_BLINK")); break;
-        case DVR_LED_FAST_BLINK:    Serial.println(F("FAST_BLINK")); break;
-        case DVR_LED_ABNORMAL_BOOT: Serial.println(F("ABNORMAL_BOOT")); break;
+        case DVR_LED_OFF:           return F("OFF");
+        case DVR_LED_SOLID:         return F("SOLID");
+        case DVR_LED_SLOW_BLINK:    return F("SLOW_BLINK");
+        case DVR_LED_FAST_BLINK:    return F("FAST_BLINK");
+        case DVR_LED_ABNORMAL_BOOT: return F("ABNORMAL_BOOT");
         case DVR_LED_UNKNOWN:
-        default:                    Serial.println(F("UNKNOWN")); break;
-    }
-#else
-    (void)p;
-#endif
-}
-
-static void dvr_led_observe_and_check_shutdown(uint32_t now_ms)
-{
-    const dvr_led_pattern_t p = drv_dvr_led_last_pattern();
-
-    // Print only on change (local observability; no queue meddling)
-    if (p != s_last_pat_printed)
-    {
-        s_last_pat_printed = p;
-        print_dvr_pattern(p);
-
-        if (p == DVR_LED_FAST_BLINK && !s_shutdown_armed)
-        {
-            s_shutdown_armed       = true;
-            s_shutdown_deadline_ms = now_ms + (uint32_t)T_BOOT_TIMEOUT_MS;
-#if CFG_DEBUG_SERIAL
-            Serial.println(F("SMOKE: shutdown signature armed (FAST_BLINK observed)."));
-#endif
-        }
-
-        if (s_shutdown_armed && p == DVR_LED_OFF)
-        {
-#if CFG_DEBUG_SERIAL
-            Serial.println(F("PASS: shutdown signature FAST_BLINK -> OFF observed."));
-#endif
-            s_shutdown_armed = false;
-        }
-    }
-
-    if (s_shutdown_armed && time_reached(now_ms, s_shutdown_deadline_ms))
-    {
-#if CFG_DEBUG_SERIAL
-        Serial.println(F("FAIL: shutdown signature not completed before timeout."));
-#endif
-        s_shutdown_armed = false;
+        default:                    return F("UNKNOWN");
     }
 }
-
-// ============================================================================
-// Battery logging (1 Hz + event logging)
-// ============================================================================
-
-static uint32_t s_bat_next_print_ms = 0;
 
 static const __FlashStringHelper* bat_state_str(battery_state_t s)
 {
@@ -127,13 +75,36 @@ static const __FlashStringHelper* bat_state_str(battery_state_t s)
     }
 }
 
-static void battery_status_print_periodic(uint32_t now)
+// ============================================================================
+// DVR LED observability (print on change only)
+// ============================================================================
+static dvr_led_pattern_t s_last_pat_printed = DVR_LED_UNKNOWN;
+
+static void dvr_led_observe(uint32_t now_ms)
 {
-#if CFG_DEBUG_SERIAL
-    if ((int32_t)(now - s_bat_next_print_ms) < 0)
+    const dvr_led_pattern_t p = drv_dvr_led_last_pattern();
+    if (p == s_last_pat_printed)
         return;
 
-    s_bat_next_print_ms = now + 1000;
+    s_last_pat_printed = p;
+
+    Serial.print(F("DVR LED PATTERN -> "));
+    Serial.println(dvr_pat_str(p));
+
+    (void)now_ms;
+}
+
+// ============================================================================
+// Battery logging (1 Hz + event logging)
+// ============================================================================
+static uint32_t s_bat_next_print_ms = 0;
+
+static void battery_status_print_periodic(uint32_t now_ms)
+{
+    if ((int32_t)(now_ms - s_bat_next_print_ms) < 0)
+        return;
+
+    s_bat_next_print_ms = now_ms + 1000;
 
     const uint16_t adc = drv_fuel_gauge_last_adc();
     const battery_state_t st = drv_fuel_gauge_last_state();
@@ -145,15 +116,11 @@ static void battery_status_print_periodic(uint32_t now)
     Serial.print(adc);
     Serial.print(F(" lockout="));
     Serial.println(lockout ? F("YES") : F("NO"));
-#else
-    (void)now;
-#endif
 }
 
 // Log EV_BAT_* events but preserve the queue for everyone else (stash+repush)
 static void battery_event_log_poll(void)
 {
-#if CFG_DEBUG_SERIAL
     enum { STASH_MAX = 16 };
     event_t stash[STASH_MAX];
     uint8_t n = 0;
@@ -168,7 +135,7 @@ static void battery_event_log_poll(void)
             Serial.print(F("EV_BAT: id="));
             Serial.print((uint16_t)ev.id);
             Serial.print(F(" state="));
-            Serial.print(bat_state_str((battery_state_t)ev.arg0));
+            Serial.print(bat_state_str((battery_state_t)(ev.arg0 & 0xFFu)));
             Serial.print(F(" adc="));
             Serial.print(ev.arg1);
             Serial.print(F(" reason="));
@@ -184,8 +151,9 @@ static void battery_event_log_poll(void)
 
     for (uint8_t i = 0; i < n; i++)
         (void)eventq_push(&stash[i]);
-#endif
 }
+
+#endif // CFG_DEBUG_SERIAL
 
 // ============================================================================
 // Setup / Loop
@@ -196,6 +164,7 @@ void setup()
 #if CFG_DEBUG_SERIAL
     Serial.begin(115200);
     delay(200);
+    Serial.println(F("APP: Randall controller starting..."));
 #endif
 
     pins_init();
@@ -215,32 +184,45 @@ void setup()
     controller_fsm_init();
 
 #if CFG_DEBUG_SERIAL
-    Serial.println(F("SMOKE(ARCH): controller_fsm + ui_policy + executor + drv_fuel_gauge + drv_dvr_led + drv_dvr_status"));
+    Serial.println(F("APP: controller_fsm + ui_policy + executor + button + fuel + dvr_led + dvr_status"));
 #endif
 }
 
 void loop()
 {
-    const uint32_t now = millis();
+    const uint32_t now_ms = millis();
 
-    // 1) Low-level producers -> events
-    button_poll(now);
-    drv_fuel_gauge_poll(now);
+    // -------------------------------------------------------------------------
+    // 1) Producers -> events
+    //    (keep these first for responsiveness)
+    // -------------------------------------------------------------------------
+    button_poll(now_ms);
+    drv_fuel_gauge_poll(now_ms);
 
-    // 2) DVR LED classifier + bridge -> EV_DVR_LED_PATTERN_CHANGED
-    drv_dvr_led_poll(now);
+    // DVR LED classifier + bridge -> EV_DVR_LED_PATTERN_CHANGED
+    drv_dvr_led_poll(now_ms);
 
-    // 3) DVR semantic discriminator (consumes LED pattern events, emits EV_DVR_* incl EV_DVR_ERROR)
-    drv_dvr_status_poll(now);
+    // DVR semantic discriminator:
+    // consumes EV_DVR_LED_PATTERN_CHANGED, emits EV_DVR_* incl EV_DVR_ERROR
+    drv_dvr_status_poll(now_ms);
 
-    // 4) Observability (does NOT touch action_queue; event_queue only via safe stash for BAT logging)
+    // -------------------------------------------------------------------------
+    // 2) Policy: consumes events -> emits actions
+    // -------------------------------------------------------------------------
+    controller_fsm_poll(now_ms);
+
+    // -------------------------------------------------------------------------
+    // 3) Executor: step engines + dispatch actions (non-blocking)
+    // -------------------------------------------------------------------------
+    executor_poll(now_ms);
+
+#if CFG_DEBUG_SERIAL
+    // -------------------------------------------------------------------------
+    // 4) Observability (safe: event_queue only via stash+repush; never touch action_queue)
+    //    Keep LAST so it cannot add latency to control behaviour.
+    // -------------------------------------------------------------------------
     battery_event_log_poll();
-    battery_status_print_periodic(now);
-    dvr_led_observe_and_check_shutdown(now);
-
-    // 5) Controller consumes events -> emits actions
-    controller_fsm_poll(now);
-
-    // 6) Executor consumes actions -> drives outputs/press engines
-    executor_poll(now);
+    battery_status_print_periodic(now_ms);
+    dvr_led_observe(now_ms);
+#endif
 }

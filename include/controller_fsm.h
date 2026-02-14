@@ -14,11 +14,12 @@
 // - issues actions into action_queue (main loop context)
 // - drives presentation via ui_policy on state transitions
 //
-// Current scope:
-// - Button gestures: EV_BTN_SHORT_PRESS / EV_BTN_LONG_PRESS
-// - Battery: EV_BAT_STATE_CHANGED, EV_BAT_LOCKOUT_ENTER/EXIT
-// - Booting behaviour: discards taps while STATE_BOOTING (no buffering)
-// - BOOTING -> IDLE is timeout-based for now (until DVR LED policy is integrated)
+// Updated scope (new canonical behaviour):
+// - MEGA power-up is handled by LTC hardware before firmware runs.
+// - On firmware start, controller enters STATE_BOOTING and immediately boots DVR for self-test.
+// - After EV_DVR_POWERED_ON_IDLE, DVR remains ON and idle (STATE_IDLE).
+// - Tap toggles recording start/stop (LED-confirmed).
+// - Long press requests graceful DVR shutdown (stop first if recording), then waits for EV_DVR_POWERED_OFF.
 //
 // Call from main loop:
 //   controller_fsm_init();

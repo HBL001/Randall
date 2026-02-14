@@ -11,33 +11,31 @@
 //   arg0 = (uint16_t)battery_state_t  (state at time of event)
 //   arg1 = adc reading (0..1023)
 //
-// Uses existing identifiers from: pins.h, thresholds.h, enums.h, timings.h, event_queue.h
+// Uses existing identifiers from: pins.h, thresholds.h, enums.h, config.h, event_queue.h
 
 #include "drv_fuel_gauge.h"
 
 #include <Arduino.h>
 
+#include "config.h"
 #include "pins.h"
 #include "thresholds.h"
-#include "timings.h"
 #include "enums.h"
 #include "event_queue.h"
 
 // -----------------------------------------------------------------------------
 // Sampling/stability configuration
-// Prefer central timings.h, but provide safe fallbacks if not defined yet.
 // -----------------------------------------------------------------------------
-#ifndef T_FUEL_SAMPLE_PERIOD_MS
-static const uint16_t kSamplePeriodMs = 200;
+
+// Prefer config.h cadence (already present in your repo).
+#ifndef CFG_BATTERY_SAMPLE_MS
+static const uint16_t kSamplePeriodMs = 250;
 #else
-static const uint16_t kSamplePeriodMs = (uint16_t)T_FUEL_SAMPLE_PERIOD_MS;
+static const uint16_t kSamplePeriodMs = (uint16_t)CFG_BATTERY_SAMPLE_MS;
 #endif
 
-#ifndef T_FUEL_STABLE_SAMPLES
+// Stability samples (module-local hygiene; do not create new global constants here)
 static const uint8_t kStableSamplesReq = 3;
-#else
-static const uint8_t kStableSamplesReq = (uint8_t)T_FUEL_STABLE_SAMPLES;
-#endif
 
 // -----------------------------------------------------------------------------
 // Internal state
@@ -75,26 +73,28 @@ static inline void emit_bat_event(uint32_t now_ms,
 static inline battery_state_t classify_battery(uint16_t adc)
 {
     // Ordered high -> low; uses thresholds.h exactly.
-    // NOTE: If you have ADC_CRITICAL and want a separate bucket, add that here
-    //       and ensure enums.h includes the matching battery_state_t.
     if (adc >= ADC_FULL) return BAT_FULL;
     if (adc >= ADC_HALF) return BAT_HALF;
     if (adc >= ADC_LOW)  return BAT_LOW;
     return BAT_CRITICAL;
 }
 
-static inline bool classify_lockout(bool currently_lockout, uint16_t adc)
+static inline bool lockout_should_be_active(bool currently_lockout, uint16_t adc)
 {
     // Hysteretic lockout decision uses thresholds.h exactly.
+    //
+    // Enter: adc <= ADC_LOCKOUT_ENTER
+    // Exit : adc >= ADC_LOCKOUT_EXIT
+    //
+    // NOTE: Your previous code had the exit condition inverted.
     if (!currently_lockout)
     {
-        // Enter lockout at or below enter threshold.
         return (adc <= ADC_LOCKOUT_ENTER);
     }
     else
     {
-        // Exit lockout only when we recover to or above exit threshold.
-        return (adc < ADC_LOCKOUT_EXIT);
+        return (adc < ADC_LOCKOUT_EXIT) ? true : false;
+        // Equivalent: stay locked out until we reach ADC_LOCKOUT_EXIT or higher.
     }
 }
 
@@ -158,7 +158,7 @@ void drv_fuel_gauge_poll(uint32_t now_ms)
     // -------------------------
     // Lockout hysteresis + stability requirement
     // -------------------------
-    const bool lockout_now = classify_lockout(g_lockout_active, adc);
+    const bool lockout_now = lockout_should_be_active(g_lockout_active, adc);
 
     if (lockout_now != g_lockout_candidate)
     {

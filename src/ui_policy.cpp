@@ -1,4 +1,15 @@
 // ui_policy.cpp
+//
+// Updated to match new canonical behaviour:
+// - On firmware start (STATE_BOOTING entry), perform the MEGA boot cue:
+//     "road runner – beep beep" + LED flashes twice
+// - Then stay in a quiet "booting" visual (FAST blink) until DVR self-test confirms idle
+// - READY (STATE_IDLE): LED solid (DVR is ON + idle; system ready)
+// - RECORDING: slow blink
+//
+// No new enums/macros are invented here; it only uses patterns that must already exist in enums.h.
+// If any of the patterns below do not exist in your enums.h, replace them with the nearest existing
+// ones (do not create new aliases).
 
 #include "ui_policy.h"
 
@@ -38,6 +49,35 @@ static inline void beep(uint32_t now_ms, beep_pattern_t p)
     emit_action(now_ms, ACT_BEEP, (uint16_t)p, 0);
 }
 
+// Boot cue: "beep beep" + LED flashes twice.
+// We implement as a beep pattern + a short LED pattern that represents "double flash".
+// This assumes enums.h provides these patterns. If your actual names differ, substitute.
+// ----------------------------------------------------------------------------
+static inline void boot_cue(uint32_t now_ms)
+{
+    // "road runner – beep beep"
+    // Prefer a dedicated pattern if you have one; otherwise BEEP_DOUBLE is acceptable.
+#ifdef BEEP_BOOT_BEEP_BEEP
+    beep(now_ms, BEEP_BOOT_BEEP_BEEP);
+#else
+    beep(now_ms, BEEP_DOUBLE);
+#endif
+
+    // LED flashes twice
+#ifdef LED_DOUBLE_FLASH
+    led(now_ms, LED_DOUBLE_FLASH);
+#else
+    // Fallback: if you don't have a dedicated "double flash" pattern,
+    // use a short "OK" / "pulse" pattern if available, else leave LED alone.
+    // (Do NOT invent new enums here.)
+#ifdef LED_OK_PULSE
+    led(now_ms, LED_OK_PULSE);
+#else
+    // No safe fallback: leave the LED pattern unchanged.
+#endif
+#endif
+}
+
 // ----------------------------------------------------------------------------
 // Public API
 // ----------------------------------------------------------------------------
@@ -63,11 +103,19 @@ void ui_policy_on_state_enter(uint32_t now_ms,
             break;
 
         case STATE_BOOTING:
+            // On entry, play MEGA boot cue once.
+            if (state_changed)
+                boot_cue(now_ms);
+
+            // While booting/self-test, show activity.
+            // Use FAST blink as "busy" until DVR confirms IDLE.
             led(now_ms, LED_FAST_BLINK);
             break;
 
         case STATE_IDLE:
+            // READY: system ready; DVR is ON and idle (solid red).
             led(now_ms, LED_SOLID);
+            // no beep here; "ready" beep/flash should come from the FSM when DVR idle is confirmed
             break;
 
         case STATE_RECORDING:
@@ -80,7 +128,7 @@ void ui_policy_on_state_enter(uint32_t now_ms,
             if (state_changed)
             {
                 if (bat == BAT_CRITICAL)
-                    beep(now_ms, BEEP_ERROR_FAST); // or a dedicated CRITICAL pattern if you have one
+                    beep(now_ms, BEEP_ERROR_FAST);
                 else
                     beep(now_ms, BEEP_LOW_BAT);
             }
@@ -96,7 +144,7 @@ void ui_policy_on_state_enter(uint32_t now_ms,
         case STATE_LOCKOUT:
             led(now_ms, LED_LOCKOUT_PATTERN);
             if (state_changed)
-                beep(now_ms, BEEP_SINGLE); // one-time “nope” cue on entry; keep quiet afterwards
+                beep(now_ms, BEEP_SINGLE);
             break;
 
         default:
@@ -109,11 +157,13 @@ void ui_policy_on_state_enter(uint32_t now_ms,
 
 void ui_policy_on_record_confirmed(uint32_t now_ms)
 {
+    // Recording started confirmation
     beep(now_ms, BEEP_DOUBLE);
 }
 
 void ui_policy_on_stop_confirmed(uint32_t now_ms)
 {
+    // Recording stopped confirmation
     beep(now_ms, BEEP_SINGLE);
 }
 

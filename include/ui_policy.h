@@ -11,6 +11,13 @@
 // Pure policy module: maps controller state + error + battery into actions.
 // This keeps the FSM free of "presentation" logic.
 //
+// Updated behaviour:
+// - On STATE_BOOTING entry, emit MEGA boot cue:
+//     "road runner – beep beep" + LED flashes twice
+// - While STATE_BOOTING, show activity (FAST blink) until DVR confirms IDLE.
+// - READY (STATE_IDLE): LED solid
+// - RECORDING: slow blink
+//
 // It enqueues ACT_LED_PATTERN / ACT_BEEP actions into the action queue.
 // It does not touch GPIO.
 //
