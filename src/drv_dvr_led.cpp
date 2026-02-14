@@ -7,11 +7,9 @@
 // Updated for "single-cycle" rise/fall classifier in dvr_led.cpp:
 //
 // Key changes:
-//  1) Reduce stability requirement to 1 for blink patterns (FAST/SLOW) so the app
-//     responds immediately once the classifier has one full cycle.
-//  2) Keep a small stability requirement for UNKNOWN/SOLID/OFF to suppress startup
-//     chatter and wiring noise.
-//  3) Keep rate-limit, but allow blink transitions through with minimal delay.
+//  1) Blink patterns (FAST/SLOW) emit immediately once stable for 1 poll.
+//  2) Quiet patterns (UNKNOWN/SOLID/OFF) require 2 stable polls to suppress chatter.
+//  3) Rate-limit applies to quiet patterns only; blink transitions bypass it.
 //
 // No buffering: emits only on accepted changes.
 
@@ -26,11 +24,11 @@
 // -----------------------------------------------------------------------------
 // Module-local hygiene only (NOT global timing constants)
 // -----------------------------------------------------------------------------
-static const uint16_t kMinEmitSpacingMs = 30;   // rate-limit rapid churn (general)
+static const uint16_t kMinEmitSpacingMsQuiet = 30;  // rate-limit ONLY for quiet churn
 
 // Stability requirements by class of pattern:
-static const uint8_t  kStableReqBlink   = 1;   // FAST/SLOW: respond immediately
-static const uint8_t  kStableReqQuiet   = 2;   // UNKNOWN/SOLID/OFF: suppress chatter
+static const uint8_t  kStableReqBlink = 1;          // FAST/SLOW: respond immediately
+static const uint8_t  kStableReqQuiet = 2;          // UNKNOWN/SOLID/OFF: suppress chatter
 
 // -----------------------------------------------------------------------------
 // Internal state
@@ -66,12 +64,9 @@ static inline void emit_led_event(uint32_t now_ms, dvr_led_pattern_t pat)
     e.t_ms   = now_ms;
     e.id     = EV_DVR_LED_PATTERN_CHANGED;
 
-#if CFG_EVENT_HAS_SRC
+    // event_t in this project includes metadata; always populate.
     e.src    = SRC_DVR_LED;
-#endif
-#if CFG_EVENT_HAS_REASON
     e.reason = EVR_CLASSIFIER_STABLE;
-#endif
 
     e.arg0   = (uint16_t)((uint8_t)pat);  // explicit width
     e.arg1   = 0;
@@ -120,10 +115,12 @@ void drv_dvr_led_poll(uint32_t now_ms)
     if (s_candidate == s_reported)
         return;
 
-    // Rate-limit chatter: we keep this for everything, but it effectively won't
-    // add perceptible lag because kMinEmitSpacingMs is small.
-    if (!time_reached(now_ms, s_last_emit_ms + kMinEmitSpacingMs))
-        return;
+    // Rate-limit chatter only for quiet patterns (UNKNOWN/SOLID/OFF).
+    if (!is_blink_pat(s_candidate))
+    {
+        if (!time_reached(now_ms, s_last_emit_ms + kMinEmitSpacingMsQuiet))
+            return;
+    }
 
     s_reported       = s_candidate;
     s_last_emit_ms   = now_ms;

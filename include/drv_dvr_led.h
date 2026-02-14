@@ -17,14 +17,15 @@
 //
 // Event contract:
 //   EV_DVR_LED_PATTERN_CHANGED
-//     arg0 = (uint8_t)dvr_led_pattern_t  (packed into uint16_t)
-//     arg1 = 0
-//     src  = SRC_DVR_LED
+//     arg0   = (uint8_t)dvr_led_pattern_t  (packed into uint16_t)
+//     arg1   = 0
+//     src    = SRC_DVR_LED
 //     reason = EVR_CLASSIFIER_STABLE
 //
 // Notes:
 //   - This module does NOT own ISR/attachInterrupt directly (that’s in dvr_led_init()).
 //   - No buffering: emits only on accepted changes (after stability filtering).
+//   - FAST/SLOW blink transitions bypass rate-limiting for responsiveness.
 // =============================================================================
 
 void drv_dvr_led_init(void);
@@ -35,4 +36,4 @@ void drv_dvr_led_poll(uint32_t now_ms);
 
 // Optional observability for debug/tests
 dvr_led_pattern_t drv_dvr_led_last_pattern(void);
-uint32_t drv_dvr_led_last_change_ms(void);
+uint32_t          drv_dvr_led_last_change_ms(void);
