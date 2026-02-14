@@ -16,13 +16,12 @@
 //   - Purely LED-driven, no new timing constants. Uses T_BOOT_TIMEOUT_MS.
 //   - High-value discriminator:
 //       FAST_BLINK persisting beyond window => ERR_DVR_CARD_ERROR
-//     (RunCam "missing microSD" tends to be persistent fast blink.)
 //   - Preserves all non-LED events by stashing + re-pushing.
 //   - Deterministic: emits only on pattern changes and one-shot error.
 //
-// Integration order in loop():
-//   drv_dvr_led_poll(now_ms);        // produces EV_DVR_LED_PATTERN_CHANGED
-//   drv_dvr_status_poll(now_ms);     // consumes it, emits semantic DVR events
+// IMPORTANT UPDATE (semantic correctness):
+//   - RECORD_STOPPED is emitted only when we positively see recording end
+//     (SLOW_BLINK -> SOLID or OFF). FAST_BLINK/UNKNOWN no longer generate STOPPED.
 
 #include "drv_dvr_status.h"
 
@@ -62,15 +61,18 @@ static inline void emit_event(uint32_t now_ms,
     event_t e;
     e.t_ms   = now_ms;
     e.id     = id;
-    e.src    = SRC_FSM;                // reuse existing source; keeps enums stable
+
+    // This is a semantic interpreter; keep enums stable by using an existing src.
+    // If you later add SRC_DVR_STATUS, switch to it.
+    e.src    = SRC_FSM;
     e.reason = reason;
+
     e.arg0   = arg0;
     e.arg1   = arg1;
     (void)eventq_push(&e);
 }
 
 // Conservative “normalising” patterns that should cancel SD suspicion.
-// (OFF is shutdown complete; SOLID is idle; UNKNOWN is transitional.)
 static inline bool cancels_fast_persist(dvr_led_pattern_t p)
 {
     return (p == DVR_LED_OFF) || (p == DVR_LED_SOLID) || (p == DVR_LED_UNKNOWN);
@@ -90,9 +92,14 @@ static void disarm_fast_persist(void)
     s_sd_error_emitted   = false;
 }
 
-static void on_pattern_changed(uint32_t now_ms, dvr_led_pattern_t pat)
+// Emit semantic events derived from a *transition* (prev -> pat)
+static void on_pattern_transition(uint32_t now_ms, dvr_led_pattern_t prev, dvr_led_pattern_t pat)
 {
-    // 1) Recording latch (SLOW_BLINK = recording)
+    // -------------------------------------------------------------------------
+    // 1) Recording latch:
+    //    - Start: entering SLOW_BLINK
+    //    - Stop: leaving SLOW_BLINK to SOLID or OFF (positive confirmation)
+    // -------------------------------------------------------------------------
     if (pat == DVR_LED_SLOW_BLINK)
     {
         if (!s_recording)
@@ -103,14 +110,21 @@ static void on_pattern_changed(uint32_t now_ms, dvr_led_pattern_t pat)
     }
     else
     {
-        if (s_recording)
+        // Only declare "stop" when we have a plausible post-record state.
+        if (s_recording && prev == DVR_LED_SLOW_BLINK)
         {
-            s_recording = false;
-            emit_event(now_ms, EV_DVR_RECORD_STOPPED, EVR_CLASSIFIER_STABLE, 0, 0);
+            if (pat == DVR_LED_SOLID || pat == DVR_LED_OFF)
+            {
+                s_recording = false;
+                emit_event(now_ms, EV_DVR_RECORD_STOPPED, EVR_CLASSIFIER_STABLE, 0, 0);
+            }
+            // If we land in FAST_BLINK/UNKNOWN, don't claim stop — it's error/transitional.
         }
     }
 
+    // -------------------------------------------------------------------------
     // 2) Power state hints
+    // -------------------------------------------------------------------------
     if (pat == DVR_LED_OFF)
     {
         emit_event(now_ms, EV_DVR_POWERED_OFF, EVR_CLASSIFIER_STABLE, 0, 0);
@@ -124,19 +138,14 @@ static void on_pattern_changed(uint32_t now_ms, dvr_led_pattern_t pat)
         disarm_fast_persist();
     }
 
+    // -------------------------------------------------------------------------
     // 3) SD card discriminator: FAST_BLINK persistence
     //
-    // Important nuance:
-    // - During shutdown, you may see FAST_BLINK then OFF fairly quickly.
-    // - In “missing microSD” error, FAST_BLINK tends to persist indefinitely.
-    //
-    // Therefore:
-    // - Arm the timer when entering FAST_BLINK.
-    // - Keep it armed while FAST_BLINK continues.
-    // - Disarm on OFF/SOLID/UNKNOWN (normalising patterns).
+    // Arm on entering FAST_BLINK, keep armed while it persists.
+    // Disarm on OFF/SOLID/UNKNOWN or any other non-fast pattern.
+    // -------------------------------------------------------------------------
     if (pat == DVR_LED_FAST_BLINK)
     {
-        // If this is a *new* episode, arm it; if already armed, leave deadline alone.
         if (!s_fast_persist_armed)
             arm_fast_persist(now_ms);
     }
@@ -146,7 +155,6 @@ static void on_pattern_changed(uint32_t now_ms, dvr_led_pattern_t pat)
     }
     else
     {
-        // For ABNORMAL_BOOT or other non-fast patterns: cancel suspicion.
         disarm_fast_persist();
     }
 }
@@ -167,8 +175,9 @@ static void poll_led_pattern_events(uint32_t now_ms)
 
             if (pat != s_last_pat)
             {
+                const dvr_led_pattern_t prev = s_last_pat;
                 s_last_pat = pat;
-                on_pattern_changed(now_ms, pat);
+                on_pattern_transition(now_ms, prev, pat);
             }
             continue;
         }
@@ -189,9 +198,7 @@ static void poll_led_pattern_events(uint32_t now_ms)
 void drv_dvr_status_init(void)
 {
     s_last_pat = DVR_LED_UNKNOWN;
-
     s_recording = false;
-
     disarm_fast_persist();
 }
 

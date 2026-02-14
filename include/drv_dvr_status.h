@@ -36,7 +36,7 @@
 //   EV_DVR_RECORD_STOPPED
 //   EV_DVR_POWERED_OFF
 //   EV_DVR_POWERED_ON_IDLE
-//   EV_DVR_ERROR                (arg0 = error_code_t)
+//   EV_DVR_ERROR                (arg0 = error_code_t, arg1 = last LED pattern)
 //
 // Error codes expected:
 //
