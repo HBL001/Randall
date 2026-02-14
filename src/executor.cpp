@@ -12,14 +12,19 @@
 // - Policy: ignore new DVR press requests while one is active,
 //           BUT do not drop the action; requeue it for later.
 //
+// Important scheduling fix:
+// - Step engines FIRST, then dispatch actions.
+//   This reduces perceived lag because a press that just finished in this tick
+//   becomes immediately available for the next queued press.
+//
 // Notes:
 // - Uses actionq_pop()/actionq_push() to preserve FIFO when actions cannot be serviced yet.
-// - We treat LED as non-blocking (never a reason to stall other actions).
+// - LED is non-blocking (never a reason to stall other actions).
 
 #include <Arduino.h>
 
-#include <executor.h>
-#include <timings.h>
+#include "executor.h"
+#include "timings.h"
 #include "pins.h"
 #include "action_queue.h"
 
@@ -138,7 +143,7 @@ static void led_step(uint32_t now_ms)
         case LED_LOCKOUT_PATTERN:
         case LED_ERROR_PATTERN:
         {
-            // Keep simple here; can be promoted into timings.h later.
+            // Local-only blink shaping. (No new global timing constants.)
             const uint16_t on_ms  = (s_led_pat == LED_FAST_BLINK) ? 100 : 300;
             const uint16_t off_ms = (s_led_pat == LED_FAST_BLINK) ? 150 : 700;
 
@@ -266,11 +271,16 @@ static void dvr_step(uint32_t now_ms)
 }
 
 // ----------------------------------------------------------------------------
-// Executor poll: dispatch queued actions (without loss), then step engines
+// Executor poll: step engines, then dispatch queued actions without loss
 // ----------------------------------------------------------------------------
 
 void executor_poll(uint32_t now_ms)
 {
+    // 0) Step engines FIRST (critical for responsiveness)
+    led_step(now_ms);
+    beep_step(now_ms);
+    dvr_step(now_ms);
+
     // 1) Dispatch actions, but NEVER drop ones we cannot execute.
     enum { STASH_MAX = 16 };
     action_t stash[STASH_MAX];
@@ -290,8 +300,7 @@ void executor_poll(uint32_t now_ms)
                 break;
 
             case ACT_BEEP:
-                // If a beep is already active, this will preempt it.
-                // If you prefer "ignore while active", change start_beep() behaviour.
+                // Preempt current beep (current behaviour).
                 start_beep(now_ms, (beep_pattern_t)(a.arg0 & 0xFF));
                 handled = true;
                 break;
@@ -324,9 +333,4 @@ void executor_poll(uint32_t now_ms)
     // Re-push unhandled actions in original order.
     for (uint8_t i = 0; i < n; i++)
         (void)actionq_push(&stash[i]);
-
-    // 2) Step all engines
-    led_step(now_ms);
-    beep_step(now_ms);
-    dvr_step(now_ms);
 }
