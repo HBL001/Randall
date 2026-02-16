@@ -36,7 +36,7 @@ typedef struct {
 } dvr_led_edge_t;
 
 static const uint8_t EDGEQ_N = 8;
-static volatile dvr_led_edge_t s_edgeq[EDGEQ_N];
+static dvr_led_edge_t s_edgeq[EDGEQ_N];
 static volatile uint8_t s_edgeq_w = 0;
 static volatile uint8_t s_edgeq_r = 0;
 
