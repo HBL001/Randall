@@ -17,10 +17,10 @@
 
 #include <Arduino.h>
 
-#include "dvr_led.h"
-#include "pins.h"
-#include "timings.h"
-#include "enums.h"
+#include <dvr_led.h>
+#include <pins.h>
+#include <timings.h>
+#include <enums.h> 
 
 // -----------------------------------------------------------------------------
 // Local hygiene: glitch reject for sniffer input edges (ms)
